@@ -121,6 +121,27 @@ typedef struct {
     Vertex* vertices_local;
 } ThreadWork;
 
+// Function to parse random mode from string
+RandomnessMode parse_random_mode(const char* mode_str) {
+    if (strcmp(mode_str, "classic") == 0) return CLASSIC_RANDOM;
+    if (strcmp(mode_str, "enhanced") == 0) return ENHANCED_RANDOM;
+    if (strcmp(mode_str, "lorenz") == 0) return LORENZ_RANDOM;
+    
+    printf("Invalid random mode '%s'. Using default (classic).\n", mode_str);
+    return CLASSIC_RANDOM;
+}
+
+// Function to parse color mode from string
+ColorMode parse_color_mode(const char* mode_str) {
+    if (strcmp(mode_str, "rgb") == 0) return COLOR_MODE_1;
+    if (strcmp(mode_str, "enhanced") == 0) return COLOR_MODE_2;
+    if (strcmp(mode_str, "mono") == 0) return COLOR_MODE_MONO;
+    if (strcmp(mode_str, "rainbow") == 0) return COLOR_MODE_RAINBOW;
+    
+    printf("Invalid color mode '%s'. Using default (rgb).\n", mode_str);
+    return COLOR_MODE_1;
+}
+
 // Function to parse pattern type from string
 PatternType parse_pattern_type(const char* pattern_str) {
     if (strcmp(pattern_str, "original") == 0) return ORIGINAL;
@@ -148,6 +169,8 @@ void print_usage(const char* program_name) {
     printf("  -t, --threads <num>    Set number of threads (1-%d, default: 4)\n", MAX_THREADS);
     printf("  -out-mode <sec> <fps>  Generate video output instead of real-time display\n");
     printf("  -o, --output <file>    Specify output video filename (default: auto-generated)\n");
+    printf("  -r, --random <mode>    Set random mode (classic, enhanced, lorenz)\n");
+    printf("  -c, --color <mode>     Set color mode (rgb, enhanced, mono, rainbow)\n");
     printf("\nControls (Real-time mode only):\n");
     printf("  ESC                    Exit program\n");
     printf("  Space                  Generate new random seed\n");
@@ -156,7 +179,7 @@ void print_usage(const char* program_name) {
     printf("  R                      Cycle through randomness modes\n");
     printf("  +/-                    Increase/decrease number of threads\n");
     printf("\nExample: %s 800 600 10 -p psychedelic --fill-rects -t 8\n", program_name);
-    printf("         %s 800 600 10 -p wave -out-mode 5 30 -o output.mp4\n", program_name);
+    printf("         %s 800 600 10 -p wave -out-mode 5 30 -o output.mp4 -r lorenz -c rainbow\n", program_name);
 }
 
 // OpenGL initialization and rendering functions
@@ -962,23 +985,30 @@ VideoContext* init_video_encoder(const char* filename, int width, int height, in
     }
     
     // Set codec parameters
-    ctx->codec_context->bit_rate = 8000000;
+    ctx->codec_context->bit_rate = 20000000;  // Increased bitrate to 20Mbps
     ctx->codec_context->width = width;
     ctx->codec_context->height = height;
     ctx->codec_context->time_base = (AVRational){1, framerate};
     ctx->codec_context->framerate = (AVRational){framerate, 1};
-    ctx->codec_context->gop_size = 10;
-    ctx->codec_context->max_b_frames = 1;
+    ctx->codec_context->gop_size = 30;  // Increased GOP size for better compression
+    ctx->codec_context->max_b_frames = 2;  // Increased B-frames
     ctx->codec_context->pix_fmt = AV_PIX_FMT_YUV420P;
+    
+    // Set x264 specific encoding parameters for high quality
+    AVDictionary *param = NULL;
+    av_dict_set(&param, "preset", "slow", 0);  // Slower encoding = better quality
+    av_dict_set(&param, "tune", "animation", 0);  // Optimize for animation content
+    av_dict_set(&param, "crf", "17", 0);  // Lower CRF = higher quality (range: 0-51, 17-18 is visually lossless)
     
     // Set stream parameters
     avcodec_parameters_from_context(ctx->video_stream->codecpar, ctx->codec_context);
     
-    // Open codec
-    if (avcodec_open2(ctx->codec_context, codec, NULL) < 0) {
+    // Open codec with quality parameters
+    if (avcodec_open2(ctx->codec_context, codec, &param) < 0) {
         fprintf(stderr, "Could not open codec\n");
         return NULL;
     }
+    av_dict_free(&param);
     
     // Open output file
     if (avio_open(&ctx->format_context->pb, filename, AVIO_FLAG_WRITE) < 0) {
@@ -1009,7 +1039,13 @@ VideoContext* init_video_encoder(const char* filename, int width, int height, in
     // Initialize scaling context
     ctx->sws_context = sws_getContext(width, height, AV_PIX_FMT_RGB24,
                                     width, height, AV_PIX_FMT_YUV420P,
-                                    SWS_BILINEAR, NULL, NULL, NULL);
+                                    SWS_LANCZOS | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT,  // High quality scaling
+                                    NULL, NULL, NULL);
+    
+    if (!ctx->sws_context) {
+        fprintf(stderr, "Could not initialize scaling context\n");
+        return NULL;
+    }
     
     return ctx;
 }
@@ -1136,6 +1172,22 @@ int main(int argc, char *argv[]) {
                 printf("Missing filename after -o option.\n");
                 exit(1);
             }
+        } else if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--random") == 0) {
+            if (i + 1 < argc) {
+                random_mode = parse_random_mode(argv[i + 1]);
+                i++;
+            } else {
+                printf("Missing random mode after -r option.\n");
+                exit(1);
+            }
+        } else if (strcmp(argv[i], "-c") == 0 || strcmp(argv[i], "--color") == 0) {
+            if (i + 1 < argc) {
+                color_mode = parse_color_mode(argv[i + 1]);
+                i++;
+            } else {
+                printf("Missing color mode after -c option.\n");
+                exit(1);
+            }
         } else {
             printf("Unknown option '%s'\n", argv[i]);
             exit(1);
@@ -1169,15 +1221,53 @@ int main(int argc, char *argv[]) {
                 case CELLULAR: pattern_name = "cellular"; break;
                 default: pattern_name = "unknown"; break;
             }
+            
+            const char* random_name;
+            switch(random_mode) {
+                case CLASSIC_RANDOM: random_name = "classic"; break;
+                case ENHANCED_RANDOM: random_name = "enhanced"; break;
+                case LORENZ_RANDOM: random_name = "lorenz"; break;
+                default: random_name = "unknown"; break;
+            }
+            
+            const char* color_name;
+            switch(color_mode) {
+                case COLOR_MODE_1: color_name = "rgb"; break;
+                case COLOR_MODE_2: color_name = "enhanced"; break;
+                case COLOR_MODE_MONO: color_name = "mono"; break;
+                case COLOR_MODE_RAINBOW: color_name = "rainbow"; break;
+                default: color_name = "unknown"; break;
+            }
+            
             snprintf(filename_buffer, sizeof(filename_buffer), 
-                    "art_%dx%d_%s_%ds.mp4", 
-                    Width, Height, pattern_name, output_config.duration_seconds);
+                    "art_%dx%d_%s_%s_%s_%ds.mp4", 
+                    Width, Height, pattern_name, random_name, color_name,
+                    output_config.duration_seconds);
             output_config.output_filename = filename_buffer;
         }
         
         printf("Generating video: %s\n", output_config.output_filename);
         printf("Duration: %d seconds at %d fps\n", 
                output_config.duration_seconds, output_config.framerate);
+        printf("Pattern: %s, Random: %s, Color: %s\n",
+               pattern_type == ORIGINAL ? "original" :
+               pattern_type == POLAR ? "polar" :
+               pattern_type == TRIGONOMETRIC ? "trig" :
+               pattern_type == FRACTAL ? "fractal" :
+               pattern_type == WAVE_INTERFERENCE ? "wave" :
+               pattern_type == SYMMETRY ? "symmetry" :
+               pattern_type == WAVE2 ? "wave2" :
+               pattern_type == VORTEX ? "vortex" :
+               pattern_type == KALEIDOSCOPE ? "kaleidoscope" :
+               pattern_type == PSYCHEDELIC ? "psychedelic" :
+               pattern_type == CELLULAR ? "cellular" : "unknown",
+               random_mode == CLASSIC_RANDOM ? "classic" :
+               random_mode == ENHANCED_RANDOM ? "enhanced" :
+               random_mode == LORENZ_RANDOM ? "lorenz" : "unknown",
+               color_mode == COLOR_MODE_1 ? "rgb" :
+               color_mode == COLOR_MODE_2 ? "enhanced" :
+               color_mode == COLOR_MODE_MONO ? "mono" :
+               color_mode == COLOR_MODE_RAINBOW ? "rainbow" : "unknown");
         
         // Initialize video encoder
         VideoContext* video_ctx = init_video_encoder(
