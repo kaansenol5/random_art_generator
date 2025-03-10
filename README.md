@@ -15,7 +15,10 @@ you need opengl and glut.
 ./randomart width height pixelsize -p pattern
 ~~~
 
-pattern can be original, polar, fractal, trig, wave, symmetry.
+pattern can be original, polar, fractal, trig, wave, symmetry and more. 
+press R to change some seeding logic, it gives a fuzzy look
+press C to change colors, makes it more vibrant
+each key 1-9 and 0 is mapped to a pattern
 default is original
 smaller pixel size = slower generation, higher detail
 press space to change the thing you see
