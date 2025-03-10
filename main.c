@@ -13,7 +13,7 @@
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
 #include <sys/time.h>
-
+#define MAX_THREADS 16
 // Video output related structures
 typedef struct {
     AVFormatContext *format_context;
@@ -88,6 +88,11 @@ int frameCount = 0;
 int fps = 0;
 int lastTime = 0;
 
+// Texture related variables
+GLuint texture_id;
+uint8_t* texture_data = NULL;  // RGB texture data
+uint8_t* thread_texture_buffers[MAX_THREADS];  // Per-thread texture buffers
+
 // OpenGL buffer objects
 GLuint VBO, IBO;
 Vertex* vertices = NULL;
@@ -97,8 +102,9 @@ int max_indices;
 
 // Thread-related variables
 #define MAX_THREADS 16
-int num_threads = 8;  // Default to 4 threads, can be adjusted based on system capabilities
+int num_threads = 8;  // Default to 8 threads
 pthread_mutex_t vertex_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t texture_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Thread work structure
 typedef struct {
@@ -107,8 +113,7 @@ typedef struct {
     unsigned long seed;
     PatternType pattern_type;
     float time_offset;
-    int vertex_count_local;
-    Vertex* vertices_local;
+    uint8_t* texture_buffer;  // Local texture buffer for this thread
 } ThreadWork;
 
 // Function to parse random mode from string
@@ -183,43 +188,29 @@ void initGL(int width, int height, int argc, char** argv) {
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     
-    // Enable alpha blending
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-    // Calculate maximum number of vertices and indices needed
-    int tiles_x = (Width + tilesize - 1) / tilesize;
-    int tiles_y = (Height + tilesize - 1) / tilesize;
-    max_vertices = tiles_x * tiles_y * 4;  // 4 vertices per quad
-    max_indices = tiles_x * tiles_y * 6;   // 6 indices per quad (2 triangles)
+    // Enable texturing
+    glEnable(GL_TEXTURE_2D);
     
-    // Allocate vertex and index buffers
-    vertices = (Vertex*)malloc(max_vertices * sizeof(Vertex));
-    indices = (GLuint*)malloc(max_indices * sizeof(GLuint));
+    // Create and initialize texture
+    glGenTextures(1, &texture_id);
+    glBindTexture(GL_TEXTURE_2D, texture_id);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     
-    // Pre-calculate indices for all quads
-    int idx = 0;
-    for(int i = 0; i < tiles_x * tiles_y; i++) {
-        int base = i * 4;
-        // First triangle
-        indices[idx++] = base;
-        indices[idx++] = base + 1;
-        indices[idx++] = base + 2;
-        // Second triangle
-        indices[idx++] = base;
-        indices[idx++] = base + 2;
-        indices[idx++] = base + 3;
+    // Allocate texture data buffer
+    texture_data = (uint8_t*)malloc(width * height * 3);  // RGB format
+    memset(texture_data, 0, width * height * 3);
+    
+    // Allocate per-thread texture buffers - allocate full height for each thread to be safe
+    for (int i = 0; i < MAX_THREADS; i++) {
+        thread_texture_buffers[i] = (uint8_t*)malloc(width * height * 3);
+        memset(thread_texture_buffers[i], 0, width * height * 3);
     }
     
-    // Create and bind VBO
-    glGenBuffers(1, &VBO);
-    glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferData(GL_ARRAY_BUFFER, max_vertices * sizeof(Vertex), NULL, GL_DYNAMIC_DRAW);
-    
-    // Create and bind IBO
-    glGenBuffers(1, &IBO);
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, IBO);
-    glBufferData(GL_ELEMENT_ARRAY_BUFFER, max_indices * sizeof(GLuint), indices, GL_STATIC_DRAW);
+    // Initialize texture with black
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, texture_data);
 }
 
 void clearScreen() {
@@ -281,11 +272,11 @@ unsigned long calculate_pattern_seed(int i, int j, PatternType pattern_type, flo
             case POLAR: {
                 float dx = i - centerX;
                 float dy = j - centerY;
-                float distance = sqrtf(dx*dx + dy*dy);
+                float distance = sqrtf(dx*dx + dy*dy) / (sqrtf(Width*Width + Height*Height) * 0.5f);
                 float angle = atan2f(dy, dx);
-                distance *= (sin(time_offset + noise) * 2.0f);
-                angle += time_offset;
-                return base_seed | (((int)(distance*10) & (int)(angle*1000)) ^ ((int)(random_factor * 1000)));
+                float pattern = (sinf(distance * 10.0f + time_offset) * 0.5f + 0.5f) * 
+                              (sinf(angle * 4.0f + time_offset + noise) * 0.5f + 0.5f);
+                return base_seed | ((int)(pattern * 1000) ^ ((int)(random_factor * 1000)));
             }
             
             case TRIGONOMETRIC: {
@@ -307,6 +298,14 @@ unsigned long calculate_pattern_seed(int i, int j, PatternType pattern_type, flo
                 float wave2 = sinf(i*0.08f*freq_var - j*0.03f*freq_var - time_offset*1.5f + random_factor) * 100;
                 float wave3 = sinf(sqrtf(powf(i-Width/2, 2) + powf(j-Height/2, 2)) * 0.1f*freq_var + time_offset*0.5f) * 100;
                 return base_seed | ((int)(wave1 + wave2 + wave3)) ^ ((int)(random_factor * 1000));
+            }
+            
+            case WAVE2: {
+                float wave_x = sinf(j * 0.1f + time_offset * 2.0f) * 10;
+                float wave_y = cosf(i * 0.1f + time_offset * 2.0f) * 10;
+                int x_new = i + (int)wave_x;
+                int y_new = j + (int)wave_y;
+                return base_seed | (x_new * y_new);
             }
             
             case VORTEX: {
@@ -359,11 +358,11 @@ unsigned long calculate_pattern_seed(int i, int j, PatternType pattern_type, flo
             case POLAR: {
                 float dx = i - centerX;
                 float dy = j - centerY;
-                float distance = sqrtf(dx*dx + dy*dy);
+                float distance = sqrtf(dx*dx + dy*dy) / (sqrtf(Width*Width + Height*Height) * 0.5f);
                 float angle = atan2f(dy, dx);
-                distance *= sin(time_offset) * 2.0f;
-                angle += time_offset;
-                return base_seed | ((int)(distance*10) & (int)(angle*1000));
+                float pattern = (sinf(distance * 10.0f + time_offset) * 0.5f + 0.5f) * 
+                              (sinf(angle * 4.0f + time_offset) * 0.5f + 0.5f);
+                return base_seed | ((int)(pattern * 1000));
             }
                 
             case TRIGONOMETRIC:
@@ -381,6 +380,14 @@ unsigned long calculate_pattern_seed(int i, int j, PatternType pattern_type, flo
                 float wave2 = sinf(i*0.08 - j*0.03 - time_offset*1.5) * 100;
                 float wave3 = sinf(sqrtf(powf(i-Width/2, 2) + powf(j-Height/2, 2)) * 0.1 + time_offset*0.5) * 100;
                 return base_seed | ((int)(wave1 + wave2 + wave3));
+            }
+                
+            case WAVE2: {
+                float wave_x = sinf(j * 0.1f + time_offset * 2.0f) * 10;
+                float wave_y = cosf(i * 0.1f + time_offset * 2.0f) * 10;
+                int x_new = i + (int)wave_x;
+                int y_new = j + (int)wave_y;
+                return base_seed | (x_new * y_new);
             }
                 
             case VORTEX: {
@@ -432,39 +439,33 @@ unsigned long calculate_pattern_seed(int i, int j, PatternType pattern_type, flo
 void* generate_art_thread(void* arg) {
     ThreadWork* work = (ThreadWork*)arg;
     
-    // Local vertex count
-    work->vertex_count_local = 0;
+    // Clear the thread's buffer first
+    memset(work->texture_buffer, 0, Width * Height * 3);
     
-    for(int i = 0; i < Width; i += tilesize) {
-        for(int j = work->start_row; j < work->end_row; j += tilesize) {
-            // Generate random factors for each tile
-            float random_factor = (float)rand() / RAND_MAX;
-            float noise = (random_factor * 2.0f - 1.0f) * 0.2f;
-            
-            unsigned long pattern_seed = calculate_pattern_seed(i, j, pattern_type, work->time_offset, Width, Height, work->seed);
+    for(int j = work->start_row; j < work->end_row; j++) {
+        for(int i = 0; i < Width; i++) {
+            // Generate pattern seed for this pixel
+            unsigned long pattern_seed = calculate_pattern_seed(i, j, work->pattern_type, 
+                                                             work->time_offset, Width, Height, work->seed);
             srand(pattern_seed);
             
             float r, g, b;
+            float random_factor = (float)rand() / RAND_MAX;
             
             if (color_mode == COLOR_MODE_1) {
-                // Original color mode code remains unchanged
-                float random_shift = (float)rand() / RAND_MAX * 0.2f - 0.1f;
+                // Original color mode
+                float random_shift = random_factor * 0.2f - 0.1f;
                 r = ((pattern_seed % 256) / 255.0f + random_shift);
                 g = (((pattern_seed >> 8) % 256) / 255.0f + random_shift);
                 b = (((pattern_seed >> 16) % 256) / 255.0f + random_shift);
                 
                 // Add time-based color pulsing with random phase
-                float phase_shift = (float)rand() / RAND_MAX * M_PI;
+                float phase_shift = random_factor * M_PI;
                 r *= (0.7f + 0.3f * sinf(work->time_offset + phase_shift));
                 g *= (0.7f + 0.3f * sinf(work->time_offset + 2.094f + phase_shift));
                 b *= (0.7f + 0.3f * sinf(work->time_offset + 4.189f + phase_shift));
-                
-                // Clamp colors
-                r = fmaxf(0.0f, fminf(1.0f, r));
-                g = fmaxf(0.0f, fminf(1.0f, g));
-                b = fmaxf(0.0f, fminf(1.0f, b));
             } else if (color_mode == COLOR_MODE_2) {
-                // Enhanced color mode code remains unchanged
+                // Enhanced color mode
                 float base = (float)(pattern_seed % 1000) / 1000.0f;
                 r = base;
                 g = fmodf(base + 0.33f + 0.1f * sinf(work->time_offset + random_factor), 1.0f);
@@ -474,73 +475,24 @@ void* generate_art_thread(void* arg) {
                 r = 0.5f + (r - 0.5f) * (1.0f + contrast);
                 g = 0.5f + (g - 0.5f) * (1.0f + contrast);
                 b = 0.5f + (b - 0.5f) * (1.0f + contrast);
-                
-                r = fmaxf(0.0f, fminf(1.0f, r));
-                g = fmaxf(0.0f, fminf(1.0f, g));
-                b = fmaxf(0.0f, fminf(1.0f, b));
-                
-                // Pattern-specific color adjustments remain unchanged
-            } else if (color_mode == COLOR_MODE_MONO) {
-                // Generate a single grayscale value
+            } else { // COLOR_MODE_MONO
                 float intensity = (float)(pattern_seed % 1000) / 1000.0f;
-                
-                // Add some temporal variation
                 intensity = intensity * 0.8f + 0.2f * sinf(work->time_offset + random_factor);
-                
-                // Add contrast
                 float contrast = 0.4f;
                 intensity = 0.5f + (intensity - 0.5f) * (1.0f + contrast);
-                
-                // Ensure the value is in valid range
-                intensity = fmaxf(0.0f, fminf(1.0f, intensity));
-                
-                // Set all color channels to the same value for monochrome
                 r = g = b = intensity;
             }
             
-            // Apply wave distortion to the tile position for WAVE2 pattern
-            float x_new = i;
-            float y_new = j;
+            // Clamp colors
+            r = fmaxf(0.0f, fminf(1.0f, r));
+            g = fmaxf(0.0f, fminf(1.0f, g));
+            b = fmaxf(0.0f, fminf(1.0f, b));
             
-            if (pattern_type == WAVE2) {
-                // Sinusoidal Tile Distortion
-                float wave_x = sinf(j * 0.1f + work->time_offset * 2.0f + random_factor) * 10;
-                float wave_y = cosf(i * 0.1f + work->time_offset * 2.0f + random_factor) * 10;
-                x_new += wave_x;
-                y_new += wave_y;
-            }
-            
-            // Add quad to local vertices array
-            int offset = work->vertex_count_local;
-            work->vertices_local[offset].x = x_new;
-            work->vertices_local[offset].y = y_new;
-            work->vertices_local[offset].r = r;
-            work->vertices_local[offset].g = g;
-            work->vertices_local[offset].b = b;
-            work->vertices_local[offset].a = 1.0f;
-            
-            work->vertices_local[offset+1].x = x_new + tilesize;
-            work->vertices_local[offset+1].y = y_new;
-            work->vertices_local[offset+1].r = r;
-            work->vertices_local[offset+1].g = g;
-            work->vertices_local[offset+1].b = b;
-            work->vertices_local[offset+1].a = 1.0f;
-            
-            work->vertices_local[offset+2].x = x_new + tilesize;
-            work->vertices_local[offset+2].y = y_new + tilesize;
-            work->vertices_local[offset+2].r = r;
-            work->vertices_local[offset+2].g = g;
-            work->vertices_local[offset+2].b = b;
-            work->vertices_local[offset+2].a = 1.0f;
-            
-            work->vertices_local[offset+3].x = x_new;
-            work->vertices_local[offset+3].y = y_new + tilesize;
-            work->vertices_local[offset+3].r = r;
-            work->vertices_local[offset+3].g = g;
-            work->vertices_local[offset+3].b = b;
-            work->vertices_local[offset+3].a = 1.0f;
-            
-            work->vertex_count_local += 4;
+            // Write directly to the correct position in the buffer
+            int pixel_idx = (j * Width + i) * 3;
+            work->texture_buffer[pixel_idx] = (uint8_t)(r * 255.0f);
+            work->texture_buffer[pixel_idx + 1] = (uint8_t)(g * 255.0f);
+            work->texture_buffer[pixel_idx + 2] = (uint8_t)(b * 255.0f);
         }
     }
     
@@ -562,74 +514,51 @@ void generateArt(unsigned long seed, PatternType pattern_type, float time_offset
     srand(seed);
     clearScreen();
     
+    // Clear main texture buffer
+    memset(texture_data, 0, Width * Height * 3);
+    
     // Create threads and distribute work
     pthread_t threads[MAX_THREADS];
     ThreadWork thread_work[MAX_THREADS];
     
-    // Calculate how many rows each thread will process
-    int rows_per_thread = (Height / tilesize + num_threads - 1) / num_threads;
+    // Calculate rows per thread, ensuring no gaps
+    int base_rows_per_thread = Height / num_threads;
+    int extra_rows = Height % num_threads;
     
-    // Allocate local vertex arrays for each thread
-    int max_vertices_per_thread = (Width / tilesize) * rows_per_thread * 4;
-    Vertex* thread_vertices[MAX_THREADS];
-    
+    int current_row = 0;
     for (int t = 0; t < num_threads; t++) {
-        thread_vertices[t] = (Vertex*)malloc(max_vertices_per_thread * sizeof(Vertex));
+        // Calculate this thread's row count (distribute extra rows evenly)
+        int this_thread_rows = base_rows_per_thread + (t < extra_rows ? 1 : 0);
         
         // Set up thread work
-        thread_work[t].start_row = t * rows_per_thread * tilesize;
-        thread_work[t].end_row = fminf((t + 1) * rows_per_thread * tilesize, Height);
+        thread_work[t].start_row = current_row;
+        thread_work[t].end_row = current_row + this_thread_rows;
         thread_work[t].seed = seed;
         thread_work[t].pattern_type = pattern_type;
         thread_work[t].time_offset = time_offset;
-        thread_work[t].vertices_local = thread_vertices[t];
+        thread_work[t].texture_buffer = thread_texture_buffers[t];
         
         // Create thread
         pthread_create(&threads[t], NULL, generate_art_thread, &thread_work[t]);
+        
+        current_row += this_thread_rows;
     }
     
     // Wait for all threads to finish and combine results
-    int vertex_index = 0;
     for (int t = 0; t < num_threads; t++) {
         pthread_join(threads[t], NULL);
-        memcpy(&vertices[vertex_index], thread_work[t].vertices_local, 
-               thread_work[t].vertex_count_local * sizeof(Vertex));
-        vertex_index += thread_work[t].vertex_count_local;
         
-        // Free thread-specific vertex array
-        free(thread_vertices[t]);
+        // Copy only the rows this thread was responsible for
+        for (int j = thread_work[t].start_row; j < thread_work[t].end_row; j++) {
+            memcpy(&texture_data[j * Width * 3],
+                   &thread_texture_buffers[t][j * Width * 3],
+                   Width * 3);
+        }
     }
     
-    // Update VBO with new vertex data
-    glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_index * sizeof(Vertex), vertices);
-    
-    // Set up vertex attributes
-    glEnableClientState(GL_VERTEX_ARRAY);
-    glEnableClientState(GL_COLOR_ARRAY);
-    
-    glVertexPointer(2, GL_FLOAT, sizeof(Vertex), (void*)0);
-    glColorPointer(4, GL_FLOAT, sizeof(Vertex), (void*)(2 * sizeof(float)));
-    
-    // Generate indices for the combined vertices
-    for (int i = 0; i < vertex_index / 4; i++) {
-        int base = i * 4;
-        indices[i*6] = base;
-        indices[i*6+1] = base + 1;
-        indices[i*6+2] = base + 2;
-        indices[i*6+3] = base;
-        indices[i*6+4] = base + 2;
-        indices[i*6+5] = base + 3;
-    }
-    
-    // Bind index buffer and draw using indices
-    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, IBO);
-    glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, (vertex_index / 4) * 6 * sizeof(GLuint), indices);
-    glDrawElements(GL_TRIANGLES, (vertex_index / 4) * 6, GL_UNSIGNED_INT, 0);
-    
-    // Cleanup
-    glDisableClientState(GL_VERTEX_ARRAY);
-    glDisableClientState(GL_COLOR_ARRAY);
+    // Update texture
+    glBindTexture(GL_TEXTURE_2D, texture_id);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, Width, Height, GL_RGB, GL_UNSIGNED_BYTE, texture_data);
     
     glutSwapBuffers();
 }
@@ -638,20 +567,40 @@ void generateArt(unsigned long seed, PatternType pattern_type, float time_offset
 void display(void) {
     static float time_offset = 0.0f;
     time_offset += 0.05f;
+    
+    // Generate art into texture
     generateArt(randseed, pattern_type, time_offset);
+    
+    // Clear screen
+    glClear(GL_COLOR_BUFFER_BIT);
+    
+    // Draw textured quad
+    glBindTexture(GL_TEXTURE_2D, texture_id);
+    glBegin(GL_QUADS);
+    glTexCoord2f(0.0f, 0.0f); glVertex2f(0.0f, 0.0f);
+    glTexCoord2f(1.0f, 0.0f); glVertex2f(Width, 0.0f);
+    glTexCoord2f(1.0f, 1.0f); glVertex2f(Width, Height);
+    glTexCoord2f(0.0f, 1.0f); glVertex2f(0.0f, Height);
+    glEnd();
+    
+    glutSwapBuffers();
 }
 
 void cleanup() {
-    if (vertices) {
-        free(vertices);
-        vertices = NULL;
+    if (texture_data) {
+        free(texture_data);
+        texture_data = NULL;
     }
-    if (indices) {
-        free(indices);
-        indices = NULL;
+    
+    // Free thread texture buffers
+    for (int i = 0; i < MAX_THREADS; i++) {
+        if (thread_texture_buffers[i]) {
+            free(thread_texture_buffers[i]);
+            thread_texture_buffers[i] = NULL;
+        }
     }
-    glDeleteBuffers(1, &VBO);
-    glDeleteBuffers(1, &IBO);
+    
+    glDeleteTextures(1, &texture_id);
 }
 
 void keyboard(unsigned char key, int x, int y) {
@@ -661,12 +610,31 @@ void keyboard(unsigned char key, int x, int y) {
     } else if (key == ' ') {
         randseed = (unsigned long)time(NULL);
     } else if (key >= '0' && key <= '9') {
-        // Change pattern type based on numeric key
-        int new_type = key - '0';
-        if (new_type < PSYCHEDELIC + 1) { // Make sure it's within enum range
-            pattern_type = new_type;
-            printf("Switched to pattern: %d\n", pattern_type);
+        // Map number keys to patterns
+        switch(key) {
+            case '0': pattern_type = ORIGINAL; break;
+            case '1': pattern_type = POLAR; break;
+            case '2': pattern_type = TRIGONOMETRIC; break;
+            case '3': pattern_type = FRACTAL; break;
+            case '4': pattern_type = WAVE_INTERFERENCE; break;
+            case '5': pattern_type = WAVE2; break;
+            case '6': pattern_type = VORTEX; break;
+            case '7': pattern_type = KALEIDOSCOPE; break;
+            case '8': pattern_type = PSYCHEDELIC; break;
+            case '9': pattern_type = CELLULAR; break;
+            default: return;
         }
+        printf("Switched to pattern: %s\n", 
+            pattern_type == ORIGINAL ? "Original" :
+            pattern_type == POLAR ? "Polar" :
+            pattern_type == TRIGONOMETRIC ? "Trigonometric" :
+            pattern_type == FRACTAL ? "Fractal" :
+            pattern_type == WAVE_INTERFERENCE ? "Wave Interference" :
+            pattern_type == WAVE2 ? "Wave 2" :
+            pattern_type == VORTEX ? "Vortex" :
+            pattern_type == KALEIDOSCOPE ? "Kaleidoscope" :
+            pattern_type == PSYCHEDELIC ? "Psychedelic" :
+            pattern_type == CELLULAR ? "Cellular" : "Unknown");
     } else if (key == 'c' || key == 'C') {
         // Cycle through color modes
         color_mode = (ColorMode)((color_mode + 1) % 3);  // Cycles through 3 modes
@@ -696,6 +664,19 @@ void keyboard(unsigned char key, int x, int y) {
         } else {
             printf("Already at minimum thread count: 1\n");
         }
+    } else if (key == 'h' || key == 'H') {
+        // Print pattern mapping help
+        printf("\nPattern Mapping:\n");
+        printf("0: Original\n");
+        printf("1: Polar\n");
+        printf("2: Trigonometric\n");
+        printf("3: Fractal\n");
+        printf("4: Wave Interference\n");
+        printf("5: Wave 2\n");
+        printf("6: Vortex\n");
+        printf("7: Kaleidoscope\n");
+        printf("8: Psychedelic\n");
+        printf("9: Cellular\n");
     } else {
         // Generate new art with current pattern type but different seed
         randseed = randseed | (key * 10);
@@ -760,7 +741,7 @@ VideoContext* init_video_encoder(const char* filename, int width, int height, in
     }
     
     // Set codec parameters
-    ctx->codec_context->bit_rate = 20000000;  // Increased bitrate to 20Mbps
+    ctx->codec_context->bit_rate = 2000000;  // Reduced to 2Mbps for reasonable file size
     ctx->codec_context->width = width;
     ctx->codec_context->height = height;
     ctx->codec_context->time_base = (AVRational){1, framerate};
@@ -771,9 +752,9 @@ VideoContext* init_video_encoder(const char* filename, int width, int height, in
     
     // Set x264 specific encoding parameters for high quality
     AVDictionary *param = NULL;
-    av_dict_set(&param, "preset", "slow", 0);  // Slower encoding = better quality
+    av_dict_set(&param, "preset", "faster", 0);  // Faster encoding, artificial content doesn't benefit much from slow
     av_dict_set(&param, "tune", "animation", 0);  // Optimize for animation content
-    av_dict_set(&param, "crf", "17", 0);  // Lower CRF = higher quality (range: 0-51, 17-18 is visually lossless)
+    av_dict_set(&param, "crf", "28", 0);  // Changed to 28 for good quality with much smaller file size
     
     // Set stream parameters
     avcodec_parameters_from_context(ctx->video_stream->codecpar, ctx->codec_context);
@@ -814,7 +795,7 @@ VideoContext* init_video_encoder(const char* filename, int width, int height, in
     // Initialize scaling context
     ctx->sws_context = sws_getContext(width, height, AV_PIX_FMT_RGB24,
                                     width, height, AV_PIX_FMT_YUV420P,
-                                    SWS_LANCZOS | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT,  // High quality scaling
+                                    SWS_BILINEAR,  // Simple bilinear filtering is sufficient for 1:1 color conversion
                                     NULL, NULL, NULL);
     
     if (!ctx->sws_context) {
@@ -1063,6 +1044,18 @@ int main(int argc, char *argv[]) {
             // Generate frame with current time offset
             clearScreen();
             generateArt(randseed, pattern_type, time_offset);
+            
+            // Draw textured quad
+            glBindTexture(GL_TEXTURE_2D, texture_id);
+            glBegin(GL_QUADS);
+            glTexCoord2f(0.0f, 0.0f); glVertex2f(0.0f, 0.0f);
+            glTexCoord2f(1.0f, 0.0f); glVertex2f(Width, 0.0f);
+            glTexCoord2f(1.0f, 1.0f); glVertex2f(Width, Height);
+            glTexCoord2f(0.0f, 1.0f); glVertex2f(0.0f, Height);
+            glEnd();
+            
+            // Make sure rendering is complete
+            glFinish();
             
             // Read pixels and encode frame
             read_pixels_to_buffer(video_ctx->frame_buffer, Width, Height);

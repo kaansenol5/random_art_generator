@@ -8,3 +8,4 @@ build/
 compile_commands.json
 main.o
 artmaker
+.DS_Store
