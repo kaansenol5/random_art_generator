@@ -27,7 +27,8 @@ typedef enum {
 typedef enum {
     COLOR_MODE_1,    // Original direct RGB mapping
     COLOR_MODE_2,    // Enhanced color relationships
-    COLOR_MODE_MONO  // Monochrome mode
+    COLOR_MODE_MONO, // Monochrome mode
+    COLOR_MODE_RAINBOW // Rainbow wave mode
 } ColorMode;
 
 // Randomness mode enum
@@ -483,6 +484,29 @@ unsigned long calculate_pattern_seed(int i, int j, PatternType pattern_type, flo
     return base_seed;
 }
 
+// Add this helper function near the top of the file
+void hsv_to_rgb(float h, float s, float v, float* r, float* g, float* b) {
+    float c = v * s;
+    float x = c * (1 - fabsf(fmodf(h * 6, 2) - 1));
+    float m = v - c;
+    
+    if(h < 1.0f/6.0f) {
+        *r = c; *g = x; *b = 0;
+    } else if(h < 2.0f/6.0f) {
+        *r = x; *g = c; *b = 0;
+    } else if(h < 3.0f/6.0f) {
+        *r = 0; *g = c; *b = x;
+    } else if(h < 4.0f/6.0f) {
+        *r = 0; *g = x; *b = c;
+    } else if(h < 5.0f/6.0f) {
+        *r = x; *g = 0; *b = c;
+    } else {
+        *r = c; *g = 0; *b = x;
+    }
+    
+    *r += m; *g += m; *b += m;
+}
+
 // Function to generate and render art
 void generateArt(unsigned long seed, PatternType pattern_type) {
     // FPS calculation
@@ -549,7 +573,7 @@ void generateArt(unsigned long seed, PatternType pattern_type) {
                 b = fmaxf(0.0f, fminf(1.0f, b));
                 
                 // Pattern-specific color adjustments remain unchanged
-            } else { // COLOR_MODE_MONO
+            } else if (color_mode == COLOR_MODE_MONO) {
                 // Generate a single grayscale value
                 float intensity = (float)(pattern_seed % 1000) / 1000.0f;
                 
@@ -565,6 +589,52 @@ void generateArt(unsigned long seed, PatternType pattern_type) {
                 
                 // Set all color channels to the same value for monochrome
                 r = g = b = intensity;
+            } else { // COLOR_MODE_RAINBOW
+                // Base hue from position and time
+                float base_hue = ((float)i/Width + (float)j/Height)/2.0f;
+                
+                // Add pattern-specific modifications
+                switch(pattern_type) {
+                    case WAVE_INTERFERENCE:
+                        base_hue += sinf(time_offset * 2.0f + (float)i/Width * 10.0f) * 0.2f;
+                        break;
+                    case VORTEX: {
+                        float dx = i - Width/2;
+                        float dy = j - Height/2;
+                        float angle = atan2f(dy, dx);
+                        base_hue += angle / (2.0f * M_PI) + time_offset * 0.1f;
+                        break;
+                    }
+                    case PSYCHEDELIC:
+                        base_hue *= 1.0f + sinf(time_offset * 3.0f) * 0.3f;
+                        break;
+                    default:
+                        base_hue += time_offset * 0.1f;
+                }
+                
+                // Add some variation based on the pattern seed
+                float seed_influence = (float)(pattern_seed % 1000) / 1000.0f * 0.2f;
+                base_hue += seed_influence;
+                
+                // Wrap hue to [0,1]
+                base_hue = fmodf(base_hue, 1.0f);
+                if(base_hue < 0) base_hue += 1.0f;
+                
+                // Saturation varies with pattern
+                float saturation = 0.8f + sinf(time_offset + (float)i/Width * 5.0f) * 0.2f;
+                
+                // Value/brightness varies with pattern and position
+                float value = 0.8f + 
+                    sinf((float)j/Height * 4.0f + time_offset) * 0.1f + 
+                    seed_influence * 0.2f;
+                
+                // Convert HSV to RGB
+                hsv_to_rgb(base_hue, saturation, value, &r, &g, &b);
+                
+                // Ensure values are in valid range
+                r = fmaxf(0.0f, fminf(1.0f, r));
+                g = fmaxf(0.0f, fminf(1.0f, g));
+                b = fmaxf(0.0f, fminf(1.0f, b));
             }
             
             // Apply wave distortion to the tile position for WAVE2 pattern
@@ -627,8 +697,12 @@ void keyboard(unsigned char key, int x, int y) {
         }
     } else if (key == 'c' || key == 'C') {
         // Cycle through color modes
-        color_mode = (ColorMode)((color_mode + 1) % 3);  // Now cycles through 3 modes
-        printf("Switched to color mode %d\n", color_mode + 1);
+        color_mode = (ColorMode)((color_mode + 1) % 4);  // Cycles through 4 modes
+        printf("Switched to %s mode\n", 
+            color_mode == COLOR_MODE_1 ? "original RGB" : 
+            color_mode == COLOR_MODE_2 ? "enhanced color" : 
+            color_mode == COLOR_MODE_MONO ? "monochrome" : 
+            "rainbow wave");
     } else if (key == 'r' || key == 'R') {
         // Cycle through random modes
         random_mode = (RandomnessMode)((random_mode + 1) % 3);
