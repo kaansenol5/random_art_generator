@@ -22,7 +22,8 @@ each key 1-9 and 0 is mapped to a pattern
 default is original
 smaller pixel size = slower generation, higher detail
 press space to change the thing you see
-press keys on the keyboard and some odd things happen.
+other key presses change the seed. this feature kinda sucks. 
+press space to make it look good again
 
 # Issues
 1. I *still* do not know why this works
