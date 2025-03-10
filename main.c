@@ -33,7 +33,8 @@ typedef enum {
 // Randomness mode enum
 typedef enum {
     CLASSIC_RANDOM,    // Original seeding method
-    ENHANCED_RANDOM    // New enhanced random method
+    ENHANCED_RANDOM,   // Enhanced random method
+    LORENZ_RANDOM     // Chaotic Lorenz attractor-based randomness
 } RandomnessMode;
 
 // Vertex structure
@@ -48,7 +49,7 @@ bool fill_rects = false;
 unsigned long randseed;
 PatternType pattern_type;
 ColorMode color_mode = COLOR_MODE_1;  // Default to original color mode
-RandomnessMode random_mode = ENHANCED_RANDOM;  // Default to enhanced random mode
+RandomnessMode random_mode = CLASSIC_RANDOM;  // Change default to CLASSIC_RANDOM
 
 // FPS counter variables
 int frameCount = 0;
@@ -59,6 +60,13 @@ int lastTime = 0;
 GLuint VBO;
 Vertex* vertices = NULL;
 int max_vertices;
+
+// Add new global variables for Lorenz system
+typedef struct {
+    float x, y, z;
+} LorenzState;
+
+LorenzState lorenz_state = {1.0f, 1.0f, 1.0f};
 
 // Function to parse pattern type from string
 PatternType parse_pattern_type(const char* pattern_str) {
@@ -183,7 +191,112 @@ unsigned long calculate_pattern_seed(int i, int j, PatternType pattern_type, flo
     int centerX = Width / 2;
     int centerY = Height / 2;
     
-    if (random_mode == ENHANCED_RANDOM) {
+    if (random_mode == LORENZ_RANDOM) {
+        // Lorenz attractor parameters - vary by pattern type
+        float sigma = 10.0f;
+        float rho = 28.0f;
+        float beta = 8.0f / 3.0f;
+        float dt = 0.001f;
+        
+        // Customize parameters based on pattern type
+        switch(pattern_type) {
+            case VORTEX:
+                sigma = 16.0f;
+                rho = 45.0f;
+                dt = 0.002f;
+                break;
+            case PSYCHEDELIC:
+                sigma = 14.0f;
+                beta = 4.0f;
+                dt = 0.003f;
+                break;
+            case WAVE_INTERFERENCE:
+                rho = 35.0f;
+                beta = 3.0f;
+                break;
+            case KALEIDOSCOPE:
+                sigma = 12.0f;
+                rho = 32.0f;
+                dt = 0.0015f;
+                break;
+            case CELLULAR:
+                sigma = 8.0f;
+                rho = 20.0f;
+                beta = 2.0f;
+                break;
+            default:
+                break;
+        }
+        
+        // Use position to influence initial conditions differently for each pattern
+        float pos_influence;
+        switch(pattern_type) {
+            case POLAR:
+                pos_influence = sqrtf(powf((float)i/Width - 0.5f, 2) + powf((float)j/Height - 0.5f, 2)) * 0.2f;
+                break;
+            case SYMMETRY:
+                pos_influence = fabsf((float)i/Width - (float)j/Height) * 0.3f;
+                break;
+            case FRACTAL:
+                pos_influence = ((float)i/Width * (float)j/Height) * 0.4f;
+                break;
+            default:
+                pos_influence = ((float)i/Width + (float)j/Height) * 0.1f;
+        }
+        
+        // Update Lorenz state with pattern-specific variations
+        float dx = sigma * (lorenz_state.y - lorenz_state.x);
+        float dy = lorenz_state.x * (rho - lorenz_state.z) - lorenz_state.y;
+        float dz = lorenz_state.x * lorenz_state.y - beta * lorenz_state.z;
+        
+        // Pattern-specific state updates
+        switch(pattern_type) {
+            case WAVE_INTERFERENCE:
+                lorenz_state.x += (dx * dt + pos_influence * sinf(time_offset * 2.0f));
+                lorenz_state.y += (dy * dt + pos_influence * cosf(time_offset * 1.5f));
+                lorenz_state.z += (dz * dt + pos_influence * sinf(time_offset * 0.5f));
+                break;
+            case VORTEX:
+                lorenz_state.x += (dx * dt * (1.0f + pos_influence));
+                lorenz_state.y += (dy * dt * (1.0f - pos_influence));
+                lorenz_state.z += (dz * dt);
+                break;
+            default:
+                lorenz_state.x += (dx * dt + pos_influence * sinf(time_offset));
+                lorenz_state.y += (dy * dt + pos_influence * cosf(time_offset));
+                lorenz_state.z += (dz * dt + pos_influence);
+        }
+        
+        // Normalize values with pattern-specific scaling
+        float scale = (pattern_type == PSYCHEDELIC) ? 30.0f : 
+                     (pattern_type == VORTEX) ? 70.0f : 
+                     (pattern_type == WAVE_INTERFERENCE) ? 40.0f : 50.0f;
+        
+        float norm_x = fabsf(fmodf(lorenz_state.x, scale)) / scale;
+        float norm_y = fabsf(fmodf(lorenz_state.y, scale)) / scale;
+        float norm_z = fabsf(fmodf(lorenz_state.z, scale)) / scale;
+        
+        // Create pattern seed with pattern-specific bit operations
+        unsigned long lorenz_seed;
+        switch(pattern_type) {
+            case PSYCHEDELIC:
+                lorenz_seed = ((unsigned long)(norm_x * 1000) << 15) ^
+                             ((unsigned long)(norm_y * 1000) << 8) ^
+                             ((unsigned long)(norm_z * 1000));
+                break;
+            case VORTEX:
+                lorenz_seed = ((unsigned long)(norm_x * 1000) << 20) |
+                             ((unsigned long)(norm_y * 1000) << 10) |
+                             ((unsigned long)(norm_z * 1000));
+                break;
+            default:
+                lorenz_seed = ((unsigned long)(norm_x * 1000) << 20) ^
+                             ((unsigned long)(norm_y * 1000) << 10) ^
+                             ((unsigned long)(norm_z * 1000));
+        }
+        
+        return lorenz_seed ^ base_seed;
+    } else if (random_mode == ENHANCED_RANDOM) {
         // Add some global randomness factors
         float random_factor = (float)rand() / RAND_MAX;
         float noise = (random_factor * 2.0f - 1.0f) * 0.2f; // Random noise between -0.2 and 0.2
@@ -501,6 +614,10 @@ void keyboard(unsigned char key, int x, int y) {
         exit(0);
     } else if (key == ' ') {
         randseed = (unsigned long)time(NULL);
+        // Reset Lorenz state when generating new seed
+        lorenz_state.x = 1.0f;
+        lorenz_state.y = 1.0f;
+        lorenz_state.z = 1.0f;
     } else if (key >= '0' && key <= '9') {
         // Change pattern type based on numeric key
         int new_type = key - '0';
@@ -513,9 +630,16 @@ void keyboard(unsigned char key, int x, int y) {
         color_mode = (ColorMode)((color_mode + 1) % 3);  // Now cycles through 3 modes
         printf("Switched to color mode %d\n", color_mode + 1);
     } else if (key == 'r' || key == 'R') {
-        // Toggle random mode
-        random_mode = (random_mode == CLASSIC_RANDOM) ? ENHANCED_RANDOM : CLASSIC_RANDOM;
-        printf("Switched to %s mode\n", random_mode == CLASSIC_RANDOM ? "classic random" : "enhanced random");
+        // Cycle through random modes
+        random_mode = (RandomnessMode)((random_mode + 1) % 3);
+        // Reset Lorenz state when changing modes
+        lorenz_state.x = 1.0f;
+        lorenz_state.y = 1.0f;
+        lorenz_state.z = 1.0f;
+        printf("Switched to %s mode\n", 
+            random_mode == CLASSIC_RANDOM ? "classic random" : 
+            random_mode == ENHANCED_RANDOM ? "enhanced random" : 
+            "Lorenz chaos");
     } else {
         // Generate new art with current pattern type but different seed
         randseed = randseed | (key * 10);
