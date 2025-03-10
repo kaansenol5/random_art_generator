@@ -6,6 +6,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <stdbool.h>
 
 // Pattern type enum
 typedef enum {
@@ -14,15 +15,55 @@ typedef enum {
     TRIGONOMETRIC,
     FRACTAL,
     WAVE_INTERFERENCE,
-    SYMMETRY
+    SYMMETRY,
+
 } PatternType;
 
+// Vertex structure
+typedef struct {
+    float x, y;           // Position
+    float r, g, b, a;     // Color
+} Vertex;
+
 // Global variables
-int Width, Height, tilesize, mode, seizure_mode, video_mode;
+int Width, Height, tilesize;
+bool fill_rects = false;
 unsigned long randseed;
 PatternType pattern_type;
 
-// OpenGL rectangle drawing functions
+// FPS counter variables
+int frameCount = 0;
+int fps = 0;
+int lastTime = 0;
+
+// OpenGL buffer objects
+GLuint VBO;
+Vertex* vertices = NULL;
+int max_vertices;
+
+// Function to parse pattern type from string
+PatternType parse_pattern_type(const char* pattern_str) {
+    if (strcmp(pattern_str, "original") == 0) return ORIGINAL;
+    if (strcmp(pattern_str, "polar") == 0) return POLAR;
+    if (strcmp(pattern_str, "trig") == 0) return TRIGONOMETRIC;
+    if (strcmp(pattern_str, "fractal") == 0) return FRACTAL;
+    if (strcmp(pattern_str, "wave") == 0) return WAVE_INTERFERENCE;
+    if (strcmp(pattern_str, "symmetry") == 0) return SYMMETRY;
+
+    
+    printf("Invalid pattern type '%s'. Using default (original).\n", pattern_str);
+    return ORIGINAL;
+}
+
+void print_usage(const char* program_name) {
+    printf("USAGE: %s <width> <height> <pixelsize> [options]\n\n", program_name);
+    printf("Options:\n");
+    printf("  -p, --pattern <type>   Set pattern type (original, polar, trig, fractal, wave, symmetry)\n");
+    printf("  --fill-rects           Fill rectangles instead of outlines\n");
+    printf("\nExample: %s 800 600 10 -p fractal --fill-rects\n", program_name);
+}
+
+// OpenGL initialization and rendering functions
 void initGL(int width, int height, int argc, char** argv) {
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGBA);
@@ -39,6 +80,19 @@ void initGL(int width, int height, int argc, char** argv) {
     // Enable alpha blending
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // Calculate maximum number of vertices needed
+    int tiles_x = (Width + tilesize - 1) / tilesize;
+    int tiles_y = (Height + tilesize - 1) / tilesize;
+    max_vertices = tiles_x * tiles_y * 6;  // 6 vertices per quad (2 triangles)
+    
+    // Allocate vertex buffer
+    vertices = (Vertex*)malloc(max_vertices * sizeof(Vertex));
+    
+    // Create and bind VBO
+    glGenBuffers(1, &VBO);
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferData(GL_ARRAY_BUFFER, max_vertices * sizeof(Vertex), NULL, GL_DYNAMIC_DRAW);
 }
 
 void clearScreen() {
@@ -46,138 +100,167 @@ void clearScreen() {
     glClear(GL_COLOR_BUFFER_BIT);
 }
 
-void drawRect(int x, int y, int width, int height, 
-              unsigned char r, unsigned char g, unsigned char b, unsigned char a, 
-              int filled) {
-    float rf = r / 255.0f;
-    float gf = g / 255.0f;
-    float bf = b / 255.0f;
-    float af = a / 255.0f;
+void addQuad(Vertex* vertices, int* vertex_count, 
+             float x, float y, float width, float height,
+             float r, float g, float b, float a) {
+    // First triangle
+    vertices[*vertex_count].x = x;
+    vertices[*vertex_count].y = y;
+    vertices[*vertex_count].r = r;
+    vertices[*vertex_count].g = g;
+    vertices[*vertex_count].b = b;
+    vertices[*vertex_count].a = a;
+    (*vertex_count)++;
+
+    vertices[*vertex_count].x = x + width;
+    vertices[*vertex_count].y = y;
+    vertices[*vertex_count].r = r;
+    vertices[*vertex_count].g = g;
+    vertices[*vertex_count].b = b;
+    vertices[*vertex_count].a = a;
+    (*vertex_count)++;
+
+    vertices[*vertex_count].x = x + width;
+    vertices[*vertex_count].y = y + height;
+    vertices[*vertex_count].r = r;
+    vertices[*vertex_count].g = g;
+    vertices[*vertex_count].b = b;
+    vertices[*vertex_count].a = a;
+    (*vertex_count)++;
+
+    // Second triangle
+    vertices[*vertex_count].x = x;
+    vertices[*vertex_count].y = y;
+    vertices[*vertex_count].r = r;
+    vertices[*vertex_count].g = g;
+    vertices[*vertex_count].b = b;
+    vertices[*vertex_count].a = a;
+    (*vertex_count)++;
+
+    vertices[*vertex_count].x = x + width;
+    vertices[*vertex_count].y = y + height;
+    vertices[*vertex_count].r = r;
+    vertices[*vertex_count].g = g;
+    vertices[*vertex_count].b = b;
+    vertices[*vertex_count].a = a;
+    (*vertex_count)++;
+
+    vertices[*vertex_count].x = x;
+    vertices[*vertex_count].y = y + height;
+    vertices[*vertex_count].r = r;
+    vertices[*vertex_count].g = g;
+    vertices[*vertex_count].b = b;
+    vertices[*vertex_count].a = a;
+    (*vertex_count)++;
+}
+
+// Function to generate pattern seed based on coordinates and pattern type
+unsigned long calculate_pattern_seed(int i, int j, PatternType pattern_type, float time_offset, int Width, int Height, unsigned long base_seed) {
+    int centerX = Width / 2;
+    int centerY = Height / 2;
     
-    glColor4f(rf, gf, bf, af);
-    
-    if (filled) {
-        glBegin(GL_QUADS);
-        glVertex2i(x, y);
-        glVertex2i(x + width, y);
-        glVertex2i(x + width, y + height);
-        glVertex2i(x, y + height);
-        glEnd();
-    } else {
-        glBegin(GL_LINE_LOOP);
-        glVertex2i(x, y);
-        glVertex2i(x + width, y);
-        glVertex2i(x + width, y + height);
-        glVertex2i(x, y + height);
-        glEnd();
+    switch(pattern_type) {
+        case ORIGINAL:
+            return base_seed | (i*j & (int)(i*cos(time_offset)*j));
+            
+        case POLAR: {
+            float dx = i - centerX;
+            float dy = j - centerY;
+            float distance = sqrtf(dx*dx + dy*dy);
+            float angle = atan2f(dy, dx);
+            distance *= sin(time_offset) * 2.0f;
+            angle += time_offset;
+            return base_seed | ((int)(distance*10) & (int)(angle*1000));
+        }
+            
+        case TRIGONOMETRIC:
+            return base_seed | ((int)(sinf(i*0.05 + time_offset)*100) * 
+                              (int)(cosf(j*0.05 - time_offset)*100));
+            
+        case FRACTAL: {
+            float scale = 8.0f + sinf(time_offset) * 4.0f;
+            return base_seed | ((i*j & i*j) ^ ((int)(i/scale)*(int)(j/scale) & 
+                              (int)(i/scale)*(int)(j/scale)));
+        }
+            
+        case WAVE_INTERFERENCE: {
+            float wave1 = sinf(i*0.05 + j*0.05 + time_offset) * 100;
+            float wave2 = sinf(i*0.08 - j*0.03 - time_offset*1.5) * 100;
+            float wave3 = sinf(sqrtf(powf(i-Width/2, 2) + powf(j-Height/2, 2)) * 0.1 + time_offset*0.5) * 100;
+            return base_seed | ((int)(wave1 + wave2 + wave3));
+        }
+            
+        case SYMMETRY: {
+            int x = i % (Width/2);
+            int y = j % (Height/2);
+            if (i >= Width/2) x = Width/2 - x;
+            if (j >= Height/2) y = Height/2 - y;
+            x = (int)(x * (1.0f + 0.5f * sinf(time_offset)));
+            y = (int)(y * (1.0f + 0.5f * cosf(time_offset)));
+            return base_seed | (x*y & x*y);
+        }
+
+
+            
+        default:
+            return base_seed;
     }
 }
 
 // Function to generate and render art
 void generateArt(unsigned long seed, PatternType pattern_type) {
+    // FPS calculation
+    frameCount++;
+    int currentTime = glutGet(GLUT_ELAPSED_TIME);
+    if (currentTime - lastTime > 1000) {
+        fps = frameCount * 1000 / (currentTime - lastTime);
+        frameCount = 0;
+        lastTime = currentTime;
+        printf("FPS: %d\n", fps);
+    }
+    
     srand(seed);
     
-    // Center coordinates for polar patterns
-    int centerX = Width / 2;
-    int centerY = Height / 2;
-    
-    // Time-based variables for video mode
     static float time_offset = 0.0f;
-    if (video_mode) {
-        time_offset += 0.05f;  // Controls animation speed
-    }
+    time_offset += 0.05f;
     
     clearScreen();
     
+    int vertex_count = 0;
+    
     for(int i = 0; i < Width; i += tilesize) {
         for(int j = 0; j < Height; j += tilesize) {
-            // Different seed calculation based on pattern type
-            unsigned long pattern_seed;
-            
-            switch(pattern_type) {
-                case ORIGINAL:
-                    if (video_mode) {
-                        pattern_seed = seed | (i*j & (int)(i*cos(time_offset)*j));
-                    } else {
-                        pattern_seed = seed | (i*j & i*j);
-                    }
-                    break;
-                case POLAR: {
-                    float dx = i - centerX;
-                    float dy = j - centerY;
-                    float distance = sqrtf(dx*dx + dy*dy);
-                    float angle = atan2f(dy, dx);
-                    if (video_mode) {
-                        distance *= sin(time_offset) * 2.0f;
-                        angle += time_offset;
-                    }
-                    pattern_seed = seed | ((int)(distance*10) & (int)(angle*1000));
-                    break;
-                }
-                case TRIGONOMETRIC:
-                    if (video_mode) {
-                        pattern_seed = seed | ((int)(sinf(i*0.05 + time_offset)*100) * 
-                                            (int)(cosf(j*0.05 - time_offset)*100));
-                    } else {
-                        pattern_seed = seed | ((int)(sinf(i*0.05)*100) * (int)(cosf(j*0.05)*100));
-                    }
-                    break;
-                case FRACTAL:
-                    if (video_mode) {
-                        float scale = 8.0f + sinf(time_offset) * 4.0f;
-                        pattern_seed = seed | ((i*j & i*j) ^ ((int)(i/scale)*(int)(j/scale) & 
-                                            (int)(i/scale)*(int)(j/scale)));
-                    } else {
-                        pattern_seed = seed | ((i*j & i*j) ^ ((i/8)*(j/8) & (i/8)*(j/8)));
-                    }
-                    break;
-                case WAVE_INTERFERENCE: {
-                    float wave1, wave2, wave3;
-                    if (video_mode) {
-                        wave1 = sinf(i*0.05 + j*0.05 + time_offset) * 100;
-                        wave2 = sinf(i*0.08 - j*0.03 - time_offset*1.5) * 100;
-                        wave3 = sinf(sqrtf(powf(i-Width/2, 2) + powf(j-Height/2, 2)) * 0.1 + time_offset*0.5) * 100;
-                    } else {
-                        wave1 = sinf(i*0.05 + j*0.05) * 100;
-                        wave2 = sinf(i*0.08 - j*0.03) * 100;
-                        wave3 = sinf(sqrtf(powf(i-Width/2, 2) + powf(j-Height/2, 2)) * 0.1) * 100;
-                    }
-                    pattern_seed = seed | ((int)(wave1 + wave2 + wave3));
-                    break;
-                }
-                case SYMMETRY: {
-                    int x = i % (Width/2);
-                    int y = j % (Height/2);
-                    if (i >= Width/2) x = Width/2 - x;
-                    if (j >= Height/2) y = Height/2 - y;
-                    if (video_mode) {
-                        x = (int)(x * (1.0f + 0.5f * sinf(time_offset)));
-                        y = (int)(y * (1.0f + 0.5f * cosf(time_offset)));
-                    }
-                    pattern_seed = seed | (x*y & x*y);
-                    break;
-                }
-            }
-            
+            unsigned long pattern_seed = calculate_pattern_seed(i, j, pattern_type, time_offset, Width, Height, seed);
             srand(pattern_seed);
             
-            // Generate color with time-based evolution in video mode
-            unsigned char r, g, b;
-            if (video_mode) {
-                r = (unsigned char)((rand() % 256) * (0.7f + 0.3f * sinf(time_offset)));
-                g = (unsigned char)((rand() % 256) * (0.7f + 0.3f * sinf(time_offset + 2.094f)));
-                b = (unsigned char)((rand() % 256) * (0.7f + 0.3f * sinf(time_offset + 4.189f)));
-            } else {
-                r = rand() % 256;
-                g = rand() % 256;
-                b = rand() % 256;
-            }
-            unsigned char a = 255; // Full opacity
+            float r = (rand() % 256) / 255.0f;
+            float g = (rand() % 256) / 255.0f;
+            float b = (rand() % 256) / 255.0f;
+            r *= (0.7f + 0.3f * sinf(time_offset));
+            g *= (0.7f + 0.3f * sinf(time_offset + 2.094f));
+            b *= (0.7f + 0.3f * sinf(time_offset + 4.189f));
             
-            // Draw rectangle
-            drawRect(i, j, tilesize, tilesize, r, g, b, a, mode == 1);
+            addQuad(vertices, &vertex_count, i, j, tilesize, tilesize, r, g, b, 1.0f);
         }
     }
+    
+    // Update VBO with new vertex data
+    glBindBuffer(GL_ARRAY_BUFFER, VBO);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_count * sizeof(Vertex), vertices);
+    
+    // Set up vertex attributes
+    glEnableClientState(GL_VERTEX_ARRAY);
+    glEnableClientState(GL_COLOR_ARRAY);
+    
+    glVertexPointer(2, GL_FLOAT, sizeof(Vertex), (void*)0);
+    glColorPointer(4, GL_FLOAT, sizeof(Vertex), (void*)(2 * sizeof(float)));
+    
+    // Draw all quads in a single call
+    glDrawArrays(GL_TRIANGLES, 0, vertex_count);
+    
+    // Cleanup
+    glDisableClientState(GL_VERTEX_ARRAY);
+    glDisableClientState(GL_COLOR_ARRAY);
     
     glutSwapBuffers();
 }
@@ -192,51 +275,45 @@ void keyboard(unsigned char key, int x, int y) {
         exit(0);
     } else if (key == ' ') {
         randseed = (unsigned long)time(NULL);
-        generateArt(randseed, pattern_type);
     } else if (key >= '0' && key <= '5') {
         // Change pattern type based on numeric key
         pattern_type = key - '0';
-        generateArt(randseed, pattern_type);
     } else {
         // Generate new art with current pattern type but different seed
-        generateArt(randseed | (key * 10), pattern_type);
+        randseed = randseed | (key * 10);
     }
 }
 
 void idle(void) {
-    if (seizure_mode || video_mode) {
-        generateArt(randseed, pattern_type);
-    }
+    generateArt(randseed, pattern_type);
 }
 
 int main(int argc, char *argv[]) {
-    if(argc < 7) {
-        printf("USAGE: randomart <width> <height> <pixelsize> <mode> <pattern_type> <video_mode> [seizure_mode]\n");
-        printf("Mode is either 0 or 1 (0 = outline, 1 = filled)\n");
-        printf("Pattern type is 0-5:\n");
-        printf("  0 = ORIGINAL\n");
-        printf("  1 = POLAR\n");
-        printf("  2 = TRIGONOMETRIC\n");
-        printf("  3 = FRACTAL\n");
-        printf("  4 = WAVE_INTERFERENCE\n");
-        printf("  5 = SYMMETRY\n");
-        printf("Video mode is 0 or 1 (0 = static, 1 = video animation)\n");
-        printf("Optional seizure_mode is 0 or 1 (default: 0)\n");
+    if(argc < 4) {
+        print_usage(argv[0]);
         exit(1);
     }
     
     Width = atoi(argv[1]);
     Height = atoi(argv[2]);
     tilesize = atoi(argv[3]);
-    mode = atoi(argv[4]);
-    pattern_type = atoi(argv[5]);
-    video_mode = atoi(argv[6]);
-    seizure_mode = (argc > 7) ? atoi(argv[7]) : 0;
     
-    // Validate pattern_type
-    if (pattern_type < 0 || pattern_type > 5) {
-        printf("Invalid pattern type. Must be between 0 and 5.\n");
-        exit(1);
+    // Parse additional options
+    for (int i = 4; i < argc; i++) {
+        if (strcmp(argv[i], "-p") == 0 || strcmp(argv[i], "--pattern") == 0) {
+            if (i + 1 < argc) {
+                pattern_type = parse_pattern_type(argv[i + 1]);
+                i++;
+            } else {
+                printf("Missing pattern type after -p option.\n");
+                exit(1);
+            }
+        } else if (strcmp(argv[i], "--fill-rects") == 0) {
+            fill_rects = true;
+        } else {
+            printf("Unknown option '%s'\n", argv[i]);
+            exit(1);
+        }
     }
     
     printf("Width: %d, Height: %d, Tile size: %d, Pattern type: %d\n", Width, Height, tilesize, pattern_type);
