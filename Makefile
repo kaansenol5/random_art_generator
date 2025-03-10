@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O3 -march=native
+CFLAGS = -Wall -Wextra -O3 -march=native -ffast-math
 FRAMEWORKS = -framework OpenGL -framework GLUT
 LIBS = -lm
 TARGET = randomart

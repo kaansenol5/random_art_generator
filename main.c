@@ -7,6 +7,7 @@
 #include <math.h>
 #include <time.h>
 #include <stdbool.h>
+#include <pthread.h>  // Add pthread library for thread support
 
 // Pattern type enum
 typedef enum {
@@ -71,6 +72,22 @@ typedef struct {
 
 LorenzState lorenz_state = {1.0f, 1.0f, 1.0f};
 
+// Thread-related variables
+#define MAX_THREADS 16
+int num_threads = 8;  // Default to 4 threads, can be adjusted based on system capabilities
+pthread_mutex_t vertex_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Thread work structure
+typedef struct {
+    int start_row;
+    int end_row;
+    unsigned long seed;
+    PatternType pattern_type;
+    float time_offset;
+    int vertex_count_local;
+    Vertex* vertices_local;
+} ThreadWork;
+
 // Function to parse pattern type from string
 PatternType parse_pattern_type(const char* pattern_str) {
     if (strcmp(pattern_str, "original") == 0) return ORIGINAL;
@@ -95,7 +112,15 @@ void print_usage(const char* program_name) {
     printf("  -p, --pattern <type>   Set pattern type (original, polar, trig, fractal, wave, wave2, symmetry,\n");
     printf("                         vortex, kaleidoscope, cellular, psychedelic)\n");
     printf("  --fill-rects           Fill rectangles instead of outlines\n");
-    printf("\nExample: %s 800 600 10 -p psychedelic --fill-rects\n", program_name);
+    printf("  -t, --threads <num>    Set number of threads (1-%d, default: 4)\n", MAX_THREADS);
+    printf("\nControls:\n");
+    printf("  ESC                    Exit program\n");
+    printf("  Space                  Generate new random seed\n");
+    printf("  0-9                    Change pattern type\n");
+    printf("  C                      Cycle through color modes\n");
+    printf("  R                      Cycle through randomness modes\n");
+    printf("  +/-                    Increase/decrease number of threads\n");
+    printf("\nExample: %s 800 600 10 -p psychedelic --fill-rects -t 8\n", program_name);
 }
 
 // OpenGL initialization and rendering functions
@@ -513,7 +538,172 @@ void hsv_to_rgb(float h, float s, float v, float* r, float* g, float* b) {
     *r += m; *g += m; *b += m;
 }
 
-// Function to generate and render art
+// Thread function for parallel processing of art generation
+void* generate_art_thread(void* arg) {
+    ThreadWork* work = (ThreadWork*)arg;
+    
+    // Local vertex count
+    work->vertex_count_local = 0;
+    
+    for(int i = 0; i < Width; i += tilesize) {
+        for(int j = work->start_row; j < work->end_row; j += tilesize) {
+            // Generate random factors for each tile
+            float random_factor = (float)rand() / RAND_MAX;
+            float noise = (random_factor * 2.0f - 1.0f) * 0.2f;
+            
+            unsigned long pattern_seed = calculate_pattern_seed(i, j, pattern_type, work->time_offset, Width, Height, work->seed);
+            srand(pattern_seed);
+            
+            float r, g, b;
+            
+            if (color_mode == COLOR_MODE_1) {
+                // Original color mode code remains unchanged
+                float random_shift = (float)rand() / RAND_MAX * 0.2f - 0.1f;
+                r = ((pattern_seed % 256) / 255.0f + random_shift);
+                g = (((pattern_seed >> 8) % 256) / 255.0f + random_shift);
+                b = (((pattern_seed >> 16) % 256) / 255.0f + random_shift);
+                
+                // Add time-based color pulsing with random phase
+                float phase_shift = (float)rand() / RAND_MAX * M_PI;
+                r *= (0.7f + 0.3f * sinf(work->time_offset + phase_shift));
+                g *= (0.7f + 0.3f * sinf(work->time_offset + 2.094f + phase_shift));
+                b *= (0.7f + 0.3f * sinf(work->time_offset + 4.189f + phase_shift));
+                
+                // Clamp colors
+                r = fmaxf(0.0f, fminf(1.0f, r));
+                g = fmaxf(0.0f, fminf(1.0f, g));
+                b = fmaxf(0.0f, fminf(1.0f, b));
+            } else if (color_mode == COLOR_MODE_2) {
+                // Enhanced color mode code remains unchanged
+                float base = (float)(pattern_seed % 1000) / 1000.0f;
+                r = base;
+                g = fmodf(base + 0.33f + 0.1f * sinf(work->time_offset + random_factor), 1.0f);
+                b = fmodf(base + 0.66f + 0.1f * cosf(work->time_offset + random_factor), 1.0f);
+                
+                float contrast = 0.3f;
+                r = 0.5f + (r - 0.5f) * (1.0f + contrast);
+                g = 0.5f + (g - 0.5f) * (1.0f + contrast);
+                b = 0.5f + (b - 0.5f) * (1.0f + contrast);
+                
+                r = fmaxf(0.0f, fminf(1.0f, r));
+                g = fmaxf(0.0f, fminf(1.0f, g));
+                b = fmaxf(0.0f, fminf(1.0f, b));
+                
+                // Pattern-specific color adjustments remain unchanged
+            } else if (color_mode == COLOR_MODE_MONO) {
+                // Generate a single grayscale value
+                float intensity = (float)(pattern_seed % 1000) / 1000.0f;
+                
+                // Add some temporal variation
+                intensity = intensity * 0.8f + 0.2f * sinf(work->time_offset + random_factor);
+                
+                // Add contrast
+                float contrast = 0.4f;
+                intensity = 0.5f + (intensity - 0.5f) * (1.0f + contrast);
+                
+                // Ensure the value is in valid range
+                intensity = fmaxf(0.0f, fminf(1.0f, intensity));
+                
+                // Set all color channels to the same value for monochrome
+                r = g = b = intensity;
+            } else { // COLOR_MODE_RAINBOW
+                // Base hue from position and time
+                float base_hue = ((float)i/Width + (float)j/Height)/2.0f;
+                
+                // Add pattern-specific modifications
+                switch(pattern_type) {
+                    case WAVE_INTERFERENCE:
+                        base_hue += sinf(work->time_offset * 2.0f + (float)i/Width * 10.0f) * 0.2f;
+                        break;
+                    case VORTEX: {
+                        float dx = i - Width/2;
+                        float dy = j - Height/2;
+                        float angle = atan2f(dy, dx);
+                        base_hue += angle / (2.0f * M_PI) + work->time_offset * 0.1f;
+                        break;
+                    }
+                    case PSYCHEDELIC:
+                        base_hue *= 1.0f + sinf(work->time_offset * 3.0f) * 0.3f;
+                        break;
+                    default:
+                        base_hue += work->time_offset * 0.1f;
+                }
+                
+                // Add some variation based on the pattern seed
+                float seed_influence = (float)(pattern_seed % 1000) / 1000.0f * 0.2f;
+                base_hue += seed_influence;
+                
+                // Wrap hue to [0,1]
+                base_hue = fmodf(base_hue, 1.0f);
+                if(base_hue < 0) base_hue += 1.0f;
+                
+                // Saturation varies with pattern
+                float saturation = 0.8f + sinf(work->time_offset + (float)i/Width * 5.0f) * 0.2f;
+                
+                // Value/brightness varies with pattern and position
+                float value = 0.8f + 
+                    sinf((float)j/Height * 4.0f + work->time_offset) * 0.1f + 
+                    seed_influence * 0.2f;
+                
+                // Convert HSV to RGB
+                hsv_to_rgb(base_hue, saturation, value, &r, &g, &b);
+                
+                // Ensure values are in valid range
+                r = fmaxf(0.0f, fminf(1.0f, r));
+                g = fmaxf(0.0f, fminf(1.0f, g));
+                b = fmaxf(0.0f, fminf(1.0f, b));
+            }
+            
+            // Apply wave distortion to the tile position for WAVE2 pattern
+            float x_new = i;
+            float y_new = j;
+            
+            if (pattern_type == WAVE2) {
+                // Sinusoidal Tile Distortion
+                float wave_x = sinf(j * 0.1f + work->time_offset * 2.0f + random_factor) * 10;
+                float wave_y = cosf(i * 0.1f + work->time_offset * 2.0f + random_factor) * 10;
+                x_new += wave_x;
+                y_new += wave_y;
+            }
+            
+            // Add quad to local vertices array
+            int offset = work->vertex_count_local;
+            work->vertices_local[offset].x = x_new;
+            work->vertices_local[offset].y = y_new;
+            work->vertices_local[offset].r = r;
+            work->vertices_local[offset].g = g;
+            work->vertices_local[offset].b = b;
+            work->vertices_local[offset].a = 1.0f;
+            
+            work->vertices_local[offset+1].x = x_new + tilesize;
+            work->vertices_local[offset+1].y = y_new;
+            work->vertices_local[offset+1].r = r;
+            work->vertices_local[offset+1].g = g;
+            work->vertices_local[offset+1].b = b;
+            work->vertices_local[offset+1].a = 1.0f;
+            
+            work->vertices_local[offset+2].x = x_new + tilesize;
+            work->vertices_local[offset+2].y = y_new + tilesize;
+            work->vertices_local[offset+2].r = r;
+            work->vertices_local[offset+2].g = g;
+            work->vertices_local[offset+2].b = b;
+            work->vertices_local[offset+2].a = 1.0f;
+            
+            work->vertices_local[offset+3].x = x_new;
+            work->vertices_local[offset+3].y = y_new + tilesize;
+            work->vertices_local[offset+3].r = r;
+            work->vertices_local[offset+3].g = g;
+            work->vertices_local[offset+3].b = b;
+            work->vertices_local[offset+3].a = 1.0f;
+            
+            work->vertex_count_local += 4;
+        }
+    }
+    
+    return NULL;
+}
+
+// Modified generateArt function to use multiple threads
 void generateArt(unsigned long seed, PatternType pattern_type) {
     // FPS calculation
     frameCount++;
@@ -532,136 +722,53 @@ void generateArt(unsigned long seed, PatternType pattern_type) {
     
     clearScreen();
     
-    int vertex_count = 0;
+    // Create threads and distribute work
+    pthread_t threads[MAX_THREADS];
+    ThreadWork thread_work[MAX_THREADS];
     
-    for(int i = 0; i < Width; i += tilesize) {
-        for(int j = 0; j < Height; j += tilesize) {
-            // Generate random factors for each tile
-            float random_factor = (float)rand() / RAND_MAX;
-            float noise = (random_factor * 2.0f - 1.0f) * 0.2f;
-            
-            unsigned long pattern_seed = calculate_pattern_seed(i, j, pattern_type, time_offset, Width, Height, seed);
-            srand(pattern_seed);
-            
-            float r, g, b;
-            
-            if (color_mode == COLOR_MODE_1) {
-                // Original color mode code remains unchanged
-                float random_shift = (float)rand() / RAND_MAX * 0.2f - 0.1f;
-                r = ((pattern_seed % 256) / 255.0f + random_shift);
-                g = (((pattern_seed >> 8) % 256) / 255.0f + random_shift);
-                b = (((pattern_seed >> 16) % 256) / 255.0f + random_shift);
-                
-                // Add time-based color pulsing with random phase
-                float phase_shift = (float)rand() / RAND_MAX * M_PI;
-                r *= (0.7f + 0.3f * sinf(time_offset + phase_shift));
-                g *= (0.7f + 0.3f * sinf(time_offset + 2.094f + phase_shift));
-                b *= (0.7f + 0.3f * sinf(time_offset + 4.189f + phase_shift));
-                
-                // Clamp colors
-                r = fmaxf(0.0f, fminf(1.0f, r));
-                g = fmaxf(0.0f, fminf(1.0f, g));
-                b = fmaxf(0.0f, fminf(1.0f, b));
-            } else if (color_mode == COLOR_MODE_2) {
-                // Enhanced color mode code remains unchanged
-                float base = (float)(pattern_seed % 1000) / 1000.0f;
-                r = base;
-                g = fmodf(base + 0.33f + 0.1f * sinf(time_offset + random_factor), 1.0f);
-                b = fmodf(base + 0.66f + 0.1f * cosf(time_offset + random_factor), 1.0f);
-                
-                float contrast = 0.3f;
-                r = 0.5f + (r - 0.5f) * (1.0f + contrast);
-                g = 0.5f + (g - 0.5f) * (1.0f + contrast);
-                b = 0.5f + (b - 0.5f) * (1.0f + contrast);
-                
-                r = fmaxf(0.0f, fminf(1.0f, r));
-                g = fmaxf(0.0f, fminf(1.0f, g));
-                b = fmaxf(0.0f, fminf(1.0f, b));
-                
-                // Pattern-specific color adjustments remain unchanged
-            } else if (color_mode == COLOR_MODE_MONO) {
-                // Generate a single grayscale value
-                float intensity = (float)(pattern_seed % 1000) / 1000.0f;
-                
-                // Add some temporal variation
-                intensity = intensity * 0.8f + 0.2f * sinf(time_offset + random_factor);
-                
-                // Add contrast
-                float contrast = 0.4f;
-                intensity = 0.5f + (intensity - 0.5f) * (1.0f + contrast);
-                
-                // Ensure the value is in valid range
-                intensity = fmaxf(0.0f, fminf(1.0f, intensity));
-                
-                // Set all color channels to the same value for monochrome
-                r = g = b = intensity;
-            } else { // COLOR_MODE_RAINBOW
-                // Base hue from position and time
-                float base_hue = ((float)i/Width + (float)j/Height)/2.0f;
-                
-                // Add pattern-specific modifications
-                switch(pattern_type) {
-                    case WAVE_INTERFERENCE:
-                        base_hue += sinf(time_offset * 2.0f + (float)i/Width * 10.0f) * 0.2f;
-                        break;
-                    case VORTEX: {
-                        float dx = i - Width/2;
-                        float dy = j - Height/2;
-                        float angle = atan2f(dy, dx);
-                        base_hue += angle / (2.0f * M_PI) + time_offset * 0.1f;
-                        break;
-                    }
-                    case PSYCHEDELIC:
-                        base_hue *= 1.0f + sinf(time_offset * 3.0f) * 0.3f;
-                        break;
-                    default:
-                        base_hue += time_offset * 0.1f;
-                }
-                
-                // Add some variation based on the pattern seed
-                float seed_influence = (float)(pattern_seed % 1000) / 1000.0f * 0.2f;
-                base_hue += seed_influence;
-                
-                // Wrap hue to [0,1]
-                base_hue = fmodf(base_hue, 1.0f);
-                if(base_hue < 0) base_hue += 1.0f;
-                
-                // Saturation varies with pattern
-                float saturation = 0.8f + sinf(time_offset + (float)i/Width * 5.0f) * 0.2f;
-                
-                // Value/brightness varies with pattern and position
-                float value = 0.8f + 
-                    sinf((float)j/Height * 4.0f + time_offset) * 0.1f + 
-                    seed_influence * 0.2f;
-                
-                // Convert HSV to RGB
-                hsv_to_rgb(base_hue, saturation, value, &r, &g, &b);
-                
-                // Ensure values are in valid range
-                r = fmaxf(0.0f, fminf(1.0f, r));
-                g = fmaxf(0.0f, fminf(1.0f, g));
-                b = fmaxf(0.0f, fminf(1.0f, b));
-            }
-            
-            // Apply wave distortion to the tile position for WAVE2 pattern
-            float x_new = i;
-            float y_new = j;
-            
-            if (pattern_type == WAVE2) {
-                // Sinusoidal Tile Distortion
-                float wave_x = sinf(j * 0.1f + time_offset * 2.0f + random_factor) * 10;
-                float wave_y = cosf(i * 0.1f + time_offset * 2.0f + random_factor) * 10;
-                x_new += wave_x;
-                y_new += wave_y;
-            }
-            
-            addQuad(vertices, &vertex_count, x_new, y_new, tilesize, tilesize, r, g, b, 1.0f);
-        }
+    // Calculate how many rows each thread will process
+    int rows_per_thread = (Height / tilesize + num_threads - 1) / num_threads;
+    
+    // Allocate local vertex arrays for each thread
+    int max_vertices_per_thread = (Width / tilesize) * rows_per_thread * 4;
+    Vertex* thread_vertices[MAX_THREADS];
+    
+    for (int t = 0; t < num_threads; t++) {
+        thread_vertices[t] = (Vertex*)malloc(max_vertices_per_thread * sizeof(Vertex));
+        
+        // Set up thread work
+        thread_work[t].start_row = t * rows_per_thread * tilesize;
+        thread_work[t].end_row = fminf((t + 1) * rows_per_thread * tilesize, Height);
+        thread_work[t].seed = seed;
+        thread_work[t].pattern_type = pattern_type;
+        thread_work[t].time_offset = time_offset;
+        thread_work[t].vertices_local = thread_vertices[t];
+        
+        // Create thread
+        pthread_create(&threads[t], NULL, generate_art_thread, &thread_work[t]);
+    }
+    
+    // Wait for all threads to finish
+    int total_vertices = 0;
+    for (int t = 0; t < num_threads; t++) {
+        pthread_join(threads[t], NULL);
+        total_vertices += thread_work[t].vertex_count_local;
+    }
+    
+    // Combine results from all threads
+    int vertex_index = 0;
+    for (int t = 0; t < num_threads; t++) {
+        memcpy(&vertices[vertex_index], thread_work[t].vertices_local, 
+               thread_work[t].vertex_count_local * sizeof(Vertex));
+        vertex_index += thread_work[t].vertex_count_local;
+        
+        // Free thread-specific vertex array
+        free(thread_vertices[t]);
     }
     
     // Update VBO with new vertex data
     glBindBuffer(GL_ARRAY_BUFFER, VBO);
-    glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_count * sizeof(Vertex), vertices);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, vertex_index * sizeof(Vertex), vertices);
     
     // Set up vertex attributes
     glEnableClientState(GL_VERTEX_ARRAY);
@@ -670,9 +777,21 @@ void generateArt(unsigned long seed, PatternType pattern_type) {
     glVertexPointer(2, GL_FLOAT, sizeof(Vertex), (void*)0);
     glColorPointer(4, GL_FLOAT, sizeof(Vertex), (void*)(2 * sizeof(float)));
     
+    // Generate indices for the combined vertices
+    for (int i = 0; i < vertex_index / 4; i++) {
+        int base = i * 4;
+        indices[i*6] = base;
+        indices[i*6+1] = base + 1;
+        indices[i*6+2] = base + 2;
+        indices[i*6+3] = base;
+        indices[i*6+4] = base + 2;
+        indices[i*6+5] = base + 3;
+    }
+    
     // Bind index buffer and draw using indices
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, IBO);
-    glDrawElements(GL_TRIANGLES, (vertex_count / 4) * 6, GL_UNSIGNED_INT, 0);
+    glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, (vertex_index / 4) * 6 * sizeof(GLuint), indices);
+    glDrawElements(GL_TRIANGLES, (vertex_index / 4) * 6, GL_UNSIGNED_INT, 0);
     
     // Cleanup
     glDisableClientState(GL_VERTEX_ARRAY);
@@ -735,6 +854,22 @@ void keyboard(unsigned char key, int x, int y) {
             random_mode == CLASSIC_RANDOM ? "classic random" : 
             random_mode == ENHANCED_RANDOM ? "enhanced random" : 
             "Lorenz chaos");
+    } else if (key == '+' || key == '=') {
+        // Increase number of threads
+        if (num_threads < MAX_THREADS) {
+            num_threads++;
+            printf("Increased to %d threads\n", num_threads);
+        } else {
+            printf("Already at maximum thread count: %d\n", MAX_THREADS);
+        }
+    } else if (key == '-' || key == '_') {
+        // Decrease number of threads
+        if (num_threads > 1) {
+            num_threads--;
+            printf("Decreased to %d threads\n", num_threads);
+        } else {
+            printf("Already at minimum thread count: 1\n");
+        }
     } else {
         // Generate new art with current pattern type but different seed
         randseed = randseed | (key * 10);
@@ -767,13 +902,29 @@ int main(int argc, char *argv[]) {
             }
         } else if (strcmp(argv[i], "--fill-rects") == 0) {
             fill_rects = true;
+        } else if (strcmp(argv[i], "-t") == 0 || strcmp(argv[i], "--threads") == 0) {
+            if (i + 1 < argc) {
+                int thread_count = atoi(argv[i + 1]);
+                if (thread_count >= 1 && thread_count <= MAX_THREADS) {
+                    num_threads = thread_count;
+                    printf("Using %d threads\n", num_threads);
+                } else {
+                    printf("Thread count must be between 1 and %d. Using default (%d).\n", 
+                           MAX_THREADS, num_threads);
+                }
+                i++;
+            } else {
+                printf("Missing thread count after -t option.\n");
+                exit(1);
+            }
         } else {
             printf("Unknown option '%s'\n", argv[i]);
             exit(1);
         }
     }
     
-    printf("Width: %d, Height: %d, Tile size: %d, Pattern type: %d\n", Width, Height, tilesize, pattern_type);
+    printf("Width: %d, Height: %d, Tile size: %d, Pattern type: %d, Threads: %d\n", 
+           Width, Height, tilesize, pattern_type, num_threads);
 
     randseed = (unsigned long)time(NULL);
     
