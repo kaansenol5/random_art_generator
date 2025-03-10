@@ -58,9 +58,11 @@ int fps = 0;
 int lastTime = 0;
 
 // OpenGL buffer objects
-GLuint VBO;
+GLuint VBO, IBO;
 Vertex* vertices = NULL;
+GLuint* indices = NULL;
 int max_vertices;
+int max_indices;
 
 // Add new global variables for Lorenz system
 typedef struct {
@@ -114,18 +116,39 @@ void initGL(int width, int height, int argc, char** argv) {
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-    // Calculate maximum number of vertices needed
+    // Calculate maximum number of vertices and indices needed
     int tiles_x = (Width + tilesize - 1) / tilesize;
     int tiles_y = (Height + tilesize - 1) / tilesize;
-    max_vertices = tiles_x * tiles_y * 6;  // 6 vertices per quad (2 triangles)
+    max_vertices = tiles_x * tiles_y * 4;  // 4 vertices per quad
+    max_indices = tiles_x * tiles_y * 6;   // 6 indices per quad (2 triangles)
     
-    // Allocate vertex buffer
+    // Allocate vertex and index buffers
     vertices = (Vertex*)malloc(max_vertices * sizeof(Vertex));
+    indices = (GLuint*)malloc(max_indices * sizeof(GLuint));
+    
+    // Pre-calculate indices for all quads
+    int idx = 0;
+    for(int i = 0; i < tiles_x * tiles_y; i++) {
+        int base = i * 4;
+        // First triangle
+        indices[idx++] = base;
+        indices[idx++] = base + 1;
+        indices[idx++] = base + 2;
+        // Second triangle
+        indices[idx++] = base;
+        indices[idx++] = base + 2;
+        indices[idx++] = base + 3;
+    }
     
     // Create and bind VBO
     glGenBuffers(1, &VBO);
     glBindBuffer(GL_ARRAY_BUFFER, VBO);
     glBufferData(GL_ARRAY_BUFFER, max_vertices * sizeof(Vertex), NULL, GL_DYNAMIC_DRAW);
+    
+    // Create and bind IBO
+    glGenBuffers(1, &IBO);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, IBO);
+    glBufferData(GL_ELEMENT_ARRAY_BUFFER, max_indices * sizeof(GLuint), indices, GL_STATIC_DRAW);
 }
 
 void clearScreen() {
@@ -136,7 +159,7 @@ void clearScreen() {
 void addQuad(Vertex* vertices, int* vertex_count, 
              float x, float y, float width, float height,
              float r, float g, float b, float a) {
-    // First triangle
+    // Add four vertices for the quad
     vertices[*vertex_count].x = x;
     vertices[*vertex_count].y = y;
     vertices[*vertex_count].r = r;
@@ -146,23 +169,6 @@ void addQuad(Vertex* vertices, int* vertex_count,
     (*vertex_count)++;
 
     vertices[*vertex_count].x = x + width;
-    vertices[*vertex_count].y = y;
-    vertices[*vertex_count].r = r;
-    vertices[*vertex_count].g = g;
-    vertices[*vertex_count].b = b;
-    vertices[*vertex_count].a = a;
-    (*vertex_count)++;
-
-    vertices[*vertex_count].x = x + width;
-    vertices[*vertex_count].y = y + height;
-    vertices[*vertex_count].r = r;
-    vertices[*vertex_count].g = g;
-    vertices[*vertex_count].b = b;
-    vertices[*vertex_count].a = a;
-    (*vertex_count)++;
-
-    // Second triangle
-    vertices[*vertex_count].x = x;
     vertices[*vertex_count].y = y;
     vertices[*vertex_count].r = r;
     vertices[*vertex_count].g = g;
@@ -664,8 +670,9 @@ void generateArt(unsigned long seed, PatternType pattern_type) {
     glVertexPointer(2, GL_FLOAT, sizeof(Vertex), (void*)0);
     glColorPointer(4, GL_FLOAT, sizeof(Vertex), (void*)(2 * sizeof(float)));
     
-    // Draw all quads in a single call
-    glDrawArrays(GL_TRIANGLES, 0, vertex_count);
+    // Bind index buffer and draw using indices
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, IBO);
+    glDrawElements(GL_TRIANGLES, (vertex_count / 4) * 6, GL_UNSIGNED_INT, 0);
     
     // Cleanup
     glDisableClientState(GL_VERTEX_ARRAY);
@@ -679,8 +686,22 @@ void display(void) {
     generateArt(randseed, pattern_type);
 }
 
+void cleanup() {
+    if (vertices) {
+        free(vertices);
+        vertices = NULL;
+    }
+    if (indices) {
+        free(indices);
+        indices = NULL;
+    }
+    glDeleteBuffers(1, &VBO);
+    glDeleteBuffers(1, &IBO);
+}
+
 void keyboard(unsigned char key, int x, int y) {
     if (key == 27) { // ESC key
+        cleanup();
         exit(0);
     } else if (key == ' ') {
         randseed = (unsigned long)time(NULL);
@@ -767,5 +788,6 @@ int main(int argc, char *argv[]) {
     // Start the main loop
     glutMainLoop();
     
+    cleanup();
     return 0;
 }
