@@ -22,6 +22,6 @@ press space to change the thing you see
 press keys on the keyboard and some odd things happen.
 
 # Issues
-1. I actually do not know why this works
+1. I *still* do not know why this works
 2. It has a using 1.3GB's of ram problem
 3. It is kinda slow
