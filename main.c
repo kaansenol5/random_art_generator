@@ -8,6 +8,38 @@
 #include <time.h>
 #include <stdbool.h>
 #include <pthread.h>  // Add pthread library for thread support
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
+#include <sys/time.h>
+
+// Video output related structures
+typedef struct {
+    AVFormatContext *format_context;
+    AVCodecContext *codec_context;
+    AVStream *video_stream;
+    AVFrame *frame;
+    uint8_t *frame_buffer;
+    struct SwsContext *sws_context;
+    int frame_count;
+    int total_frames;
+    double start_time;
+} VideoContext;
+
+// Output mode enum
+typedef enum {
+    REALTIME_MODE,
+    VIDEO_MODE
+} OutputMode;
+
+// Output configuration
+typedef struct {
+    OutputMode mode;
+    int duration_seconds;
+    int framerate;
+    char *output_filename;
+} OutputConfig;
 
 // Pattern type enum
 typedef enum {
@@ -52,6 +84,7 @@ unsigned long randseed;
 PatternType pattern_type;
 ColorMode color_mode = COLOR_MODE_1;  // Default to original color mode
 RandomnessMode random_mode = CLASSIC_RANDOM;  // Change default to CLASSIC_RANDOM
+OutputConfig output_config = {REALTIME_MODE, 0, 0, NULL};  // Default to realtime mode
 
 // FPS counter variables
 int frameCount = 0;
@@ -113,7 +146,9 @@ void print_usage(const char* program_name) {
     printf("                         vortex, kaleidoscope, cellular, psychedelic)\n");
     printf("  --fill-rects           Fill rectangles instead of outlines\n");
     printf("  -t, --threads <num>    Set number of threads (1-%d, default: 4)\n", MAX_THREADS);
-    printf("\nControls:\n");
+    printf("  -out-mode <sec> <fps>  Generate video output instead of real-time display\n");
+    printf("  -o, --output <file>    Specify output video filename (default: auto-generated)\n");
+    printf("\nControls (Real-time mode only):\n");
     printf("  ESC                    Exit program\n");
     printf("  Space                  Generate new random seed\n");
     printf("  0-9                    Change pattern type\n");
@@ -121,6 +156,7 @@ void print_usage(const char* program_name) {
     printf("  R                      Cycle through randomness modes\n");
     printf("  +/-                    Increase/decrease number of threads\n");
     printf("\nExample: %s 800 600 10 -p psychedelic --fill-rects -t 8\n", program_name);
+    printf("         %s 800 600 10 -p wave -out-mode 5 30 -o output.mp4\n", program_name);
 }
 
 // OpenGL initialization and rendering functions
@@ -218,7 +254,7 @@ void addQuad(Vertex* vertices, int* vertex_count,
     (*vertex_count)++;
 }
 
-// Function to generate pattern seed based on coordinates and pattern type
+// Function to calculate pattern seed with time offset
 unsigned long calculate_pattern_seed(int i, int j, PatternType pattern_type, float time_offset, int Width, int Height, unsigned long base_seed) {
     int centerX = Width / 2;
     int centerY = Height / 2;
@@ -335,16 +371,16 @@ unsigned long calculate_pattern_seed(int i, int j, PatternType pattern_type, flo
         
         switch(pattern_type) {
             case ORIGINAL:
-                return base_seed | (i*j & (int)(i*cos(time_offset + noise)*j)) ^ ((int)(random_factor * 1000));
+                return base_seed | ((i*j & (int)(i*cos(time_offset + noise)*j)) ^ ((int)(random_factor * 1000)));
                 
             case POLAR: {
                 float dx = i - centerX;
                 float dy = j - centerY;
                 float distance = sqrtf(dx*dx + dy*dy);
                 float angle = atan2f(dy, dx);
-                distance *= (sin(time_offset) + noise) * 2.0f;
-                angle += time_offset + random_factor * M_PI;
-                return base_seed | ((int)(distance*10) & (int)(angle*1000)) ^ ((int)(random_factor * 1000));
+                distance *= (sin(time_offset + noise) * 2.0f);
+                angle += time_offset;
+                return base_seed | (((int)(distance*10) & (int)(angle*1000)) ^ ((int)(random_factor * 1000)));
             }
             
             case TRIGONOMETRIC: {
@@ -704,7 +740,7 @@ void* generate_art_thread(void* arg) {
 }
 
 // Modified generateArt function to use multiple threads
-void generateArt(unsigned long seed, PatternType pattern_type) {
+void generateArt(unsigned long seed, PatternType pattern_type, float time_offset) {
     // FPS calculation
     frameCount++;
     int currentTime = glutGet(GLUT_ELAPSED_TIME);
@@ -716,10 +752,6 @@ void generateArt(unsigned long seed, PatternType pattern_type) {
     }
     
     srand(seed);
-    
-    static float time_offset = 0.0f;
-    time_offset += 0.05f;
-    
     clearScreen();
     
     // Create threads and distribute work
@@ -748,16 +780,10 @@ void generateArt(unsigned long seed, PatternType pattern_type) {
         pthread_create(&threads[t], NULL, generate_art_thread, &thread_work[t]);
     }
     
-    // Wait for all threads to finish
-    int total_vertices = 0;
-    for (int t = 0; t < num_threads; t++) {
-        pthread_join(threads[t], NULL);
-        total_vertices += thread_work[t].vertex_count_local;
-    }
-    
-    // Combine results from all threads
+    // Wait for all threads to finish and combine results
     int vertex_index = 0;
     for (int t = 0; t < num_threads; t++) {
+        pthread_join(threads[t], NULL);
         memcpy(&vertices[vertex_index], thread_work[t].vertices_local, 
                thread_work[t].vertex_count_local * sizeof(Vertex));
         vertex_index += thread_work[t].vertex_count_local;
@@ -802,7 +828,9 @@ void generateArt(unsigned long seed, PatternType pattern_type) {
 
 // GLUT callback functions
 void display(void) {
-    generateArt(randseed, pattern_type);
+    static float time_offset = 0.0f;
+    time_offset += 0.05f;
+    generateArt(randseed, pattern_type, time_offset);
 }
 
 void cleanup() {
@@ -877,7 +905,180 @@ void keyboard(unsigned char key, int x, int y) {
 }
 
 void idle(void) {
-    generateArt(randseed, pattern_type);
+    display();
+}
+
+// Function to get current time in seconds
+double get_current_time() {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return tv.tv_sec + tv.tv_usec / 1000000.0;
+}
+
+// Function to print progress
+void print_progress(int current_frame, int total_frames, double start_time) {
+    double current_time = get_current_time();
+    double elapsed = current_time - start_time;
+    double progress = (double)current_frame / total_frames;
+    double estimated_total = elapsed / progress;
+    double remaining = estimated_total - elapsed;
+    
+    printf("\rProgress: %d/%d frames (%.1f%%) - Elapsed: %.1fs - Remaining: %.1fs", 
+           current_frame, total_frames, progress * 100, 
+           elapsed, remaining);
+    fflush(stdout);
+}
+
+// Initialize video encoding context
+VideoContext* init_video_encoder(const char* filename, int width, int height, int framerate) {
+    VideoContext* ctx = (VideoContext*)calloc(1, sizeof(VideoContext));
+    
+    // Allocate format context
+    avformat_alloc_output_context2(&ctx->format_context, NULL, NULL, filename);
+    if (!ctx->format_context) {
+        fprintf(stderr, "Could not create output context\n");
+        return NULL;
+    }
+    
+    // Find the h264 encoder
+    const AVCodec *codec = avcodec_find_encoder_by_name("libx264");
+    if (!codec) {
+        fprintf(stderr, "Codec not found\n");
+        return NULL;
+    }
+    
+    // Create new video stream
+    ctx->video_stream = avformat_new_stream(ctx->format_context, codec);
+    if (!ctx->video_stream) {
+        fprintf(stderr, "Could not allocate stream\n");
+        return NULL;
+    }
+    
+    // Allocate codec context
+    ctx->codec_context = avcodec_alloc_context3(codec);
+    if (!ctx->codec_context) {
+        fprintf(stderr, "Could not allocate video codec context\n");
+        return NULL;
+    }
+    
+    // Set codec parameters
+    ctx->codec_context->bit_rate = 8000000;
+    ctx->codec_context->width = width;
+    ctx->codec_context->height = height;
+    ctx->codec_context->time_base = (AVRational){1, framerate};
+    ctx->codec_context->framerate = (AVRational){framerate, 1};
+    ctx->codec_context->gop_size = 10;
+    ctx->codec_context->max_b_frames = 1;
+    ctx->codec_context->pix_fmt = AV_PIX_FMT_YUV420P;
+    
+    // Set stream parameters
+    avcodec_parameters_from_context(ctx->video_stream->codecpar, ctx->codec_context);
+    
+    // Open codec
+    if (avcodec_open2(ctx->codec_context, codec, NULL) < 0) {
+        fprintf(stderr, "Could not open codec\n");
+        return NULL;
+    }
+    
+    // Open output file
+    if (avio_open(&ctx->format_context->pb, filename, AVIO_FLAG_WRITE) < 0) {
+        fprintf(stderr, "Could not open output file '%s'\n", filename);
+        return NULL;
+    }
+    
+    // Write format header
+    if (avformat_write_header(ctx->format_context, NULL) < 0) {
+        fprintf(stderr, "Error occurred when writing header\n");
+        return NULL;
+    }
+    
+    // Allocate frame
+    ctx->frame = av_frame_alloc();
+    ctx->frame->format = ctx->codec_context->pix_fmt;
+    ctx->frame->width = width;
+    ctx->frame->height = height;
+    
+    if (av_frame_get_buffer(ctx->frame, 0) < 0) {
+        fprintf(stderr, "Could not allocate frame data\n");
+        return NULL;
+    }
+    
+    // Initialize frame buffer for RGB data
+    ctx->frame_buffer = (uint8_t*)malloc(width * height * 3);
+    
+    // Initialize scaling context
+    ctx->sws_context = sws_getContext(width, height, AV_PIX_FMT_RGB24,
+                                    width, height, AV_PIX_FMT_YUV420P,
+                                    SWS_BILINEAR, NULL, NULL, NULL);
+    
+    return ctx;
+}
+
+// Encode a frame
+int encode_frame(VideoContext* ctx, const uint8_t* rgb_data) {
+    // Convert RGB to YUV
+    const uint8_t* rgb_data_ptr[1] = { rgb_data };
+    int rgb_linesize[1] = { ctx->codec_context->width * 3 };
+    sws_scale(ctx->sws_context, rgb_data_ptr, rgb_linesize, 0, ctx->codec_context->height,
+              ctx->frame->data, ctx->frame->linesize);
+    
+    ctx->frame->pts = ctx->frame_count;
+    
+    // Send frame to encoder
+    int ret = avcodec_send_frame(ctx->codec_context, ctx->frame);
+    if (ret < 0) {
+        fprintf(stderr, "Error sending frame for encoding\n");
+        return -1;
+    }
+    
+    while (ret >= 0) {
+        AVPacket *pkt = av_packet_alloc();
+        ret = avcodec_receive_packet(ctx->codec_context, pkt);
+        if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+            av_packet_free(&pkt);
+            break;
+        } else if (ret < 0) {
+            fprintf(stderr, "Error during encoding\n");
+            av_packet_free(&pkt);
+            return -1;
+        }
+        
+        pkt->stream_index = ctx->video_stream->index;
+        av_packet_rescale_ts(pkt, ctx->codec_context->time_base, ctx->video_stream->time_base);
+        ret = av_interleaved_write_frame(ctx->format_context, pkt);
+        av_packet_free(&pkt);
+        if (ret < 0) {
+            fprintf(stderr, "Error writing packet\n");
+            return -1;
+        }
+    }
+    
+    return 0;
+}
+
+// Finalize video encoding
+void finalize_video_encoder(VideoContext* ctx) {
+    // Flush encoder
+    encode_frame(ctx, NULL);
+    
+    // Write trailer
+    av_write_trailer(ctx->format_context);
+    
+    // Close file
+    avio_closep(&ctx->format_context->pb);
+    
+    // Free resources
+    avcodec_free_context(&ctx->codec_context);
+    av_frame_free(&ctx->frame);
+    avformat_free_context(ctx->format_context);
+    sws_freeContext(ctx->sws_context);
+    free(ctx->frame_buffer);
+    free(ctx);
+}
+
+// Function to read framebuffer
+void read_pixels_to_buffer(uint8_t* buffer, int width, int height) {
+    glReadPixels(0, 0, width, height, GL_RGB, GL_UNSIGNED_BYTE, buffer);
 }
 
 int main(int argc, char *argv[]) {
@@ -917,6 +1118,24 @@ int main(int argc, char *argv[]) {
                 printf("Missing thread count after -t option.\n");
                 exit(1);
             }
+        } else if (strcmp(argv[i], "-out-mode") == 0) {
+            if (i + 2 < argc) {
+                output_config.mode = VIDEO_MODE;
+                output_config.duration_seconds = atoi(argv[i + 1]);
+                output_config.framerate = atoi(argv[i + 2]);
+                i += 2;
+            } else {
+                printf("Missing duration and/or framerate after -out-mode option.\n");
+                exit(1);
+            }
+        } else if (strcmp(argv[i], "-o") == 0 || strcmp(argv[i], "--output") == 0) {
+            if (i + 1 < argc) {
+                output_config.output_filename = argv[i + 1];
+                i++;
+            } else {
+                printf("Missing filename after -o option.\n");
+                exit(1);
+            }
         } else {
             printf("Unknown option '%s'\n", argv[i]);
             exit(1);
@@ -931,13 +1150,89 @@ int main(int argc, char *argv[]) {
     // Initialize OpenGL
     initGL(Width, Height, argc, argv);
     
-    // Register callbacks
-    glutDisplayFunc(display);
-    glutKeyboardFunc(keyboard);
-    glutIdleFunc(idle);
-    
-    // Start the main loop
-    glutMainLoop();
+    if (output_config.mode == VIDEO_MODE) {
+        // Generate output filename if not specified
+        char filename_buffer[256];
+        if (!output_config.output_filename) {
+            const char* pattern_name;
+            switch(pattern_type) {
+                case ORIGINAL: pattern_name = "original"; break;
+                case POLAR: pattern_name = "polar"; break;
+                case TRIGONOMETRIC: pattern_name = "trig"; break;
+                case FRACTAL: pattern_name = "fractal"; break;
+                case WAVE_INTERFERENCE: pattern_name = "wave"; break;
+                case SYMMETRY: pattern_name = "symmetry"; break;
+                case WAVE2: pattern_name = "wave2"; break;
+                case VORTEX: pattern_name = "vortex"; break;
+                case KALEIDOSCOPE: pattern_name = "kaleidoscope"; break;
+                case PSYCHEDELIC: pattern_name = "psychedelic"; break;
+                case CELLULAR: pattern_name = "cellular"; break;
+                default: pattern_name = "unknown"; break;
+            }
+            snprintf(filename_buffer, sizeof(filename_buffer), 
+                    "art_%dx%d_%s_%ds.mp4", 
+                    Width, Height, pattern_name, output_config.duration_seconds);
+            output_config.output_filename = filename_buffer;
+        }
+        
+        printf("Generating video: %s\n", output_config.output_filename);
+        printf("Duration: %d seconds at %d fps\n", 
+               output_config.duration_seconds, output_config.framerate);
+        
+        // Initialize video encoder
+        VideoContext* video_ctx = init_video_encoder(
+            output_config.output_filename, 
+            Width, Height, 
+            output_config.framerate
+        );
+        
+        if (!video_ctx) {
+            fprintf(stderr, "Failed to initialize video encoder\n");
+            exit(1);
+        }
+        
+        // Calculate total frames
+        int total_frames = output_config.duration_seconds * output_config.framerate;
+        video_ctx->total_frames = total_frames;
+        video_ctx->start_time = get_current_time();
+        
+        // Generate and encode frames
+        float time_offset = 0.0f;
+        float time_step = 0.05f;  // Match the real-time animation speed
+        
+        for (int frame = 0; frame < total_frames; frame++) {
+            // Generate frame with current time offset
+            clearScreen();
+            generateArt(randseed, pattern_type, time_offset);
+            
+            // Read pixels and encode frame
+            read_pixels_to_buffer(video_ctx->frame_buffer, Width, Height);
+            if (encode_frame(video_ctx, video_ctx->frame_buffer) < 0) {
+                fprintf(stderr, "Error encoding frame %d\n", frame);
+                break;
+            }
+            
+            // Update progress and time offset
+            print_progress(frame + 1, total_frames, video_ctx->start_time);
+            video_ctx->frame_count++;
+            time_offset += time_step;
+        }
+        
+        printf("\nFinishing video encoding...\n");
+        finalize_video_encoder(video_ctx);
+        printf("Video generation complete: %s\n", output_config.output_filename);
+        
+        cleanup();
+        exit(0);
+    } else {
+        // Register callbacks for real-time mode
+        glutDisplayFunc(display);
+        glutKeyboardFunc(keyboard);
+        glutIdleFunc(idle);
+        
+        // Start the main loop
+        glutMainLoop();
+    }
     
     cleanup();
     return 0;

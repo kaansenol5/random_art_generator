@@ -1,20 +1,14 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O3 -march=native -ffast-math
+CFLAGS = -Wall -O2
 FRAMEWORKS = -framework OpenGL -framework GLUT
-LIBS = -lm
-TARGET = randomart
-SRCS = main.c
-OBJS = $(SRCS:.c=.o)
+FFMPEG_LIBS = -L/opt/homebrew/lib -lavcodec -lavformat -lavutil -lswscale
+FFMPEG_CFLAGS = $(shell pkg-config --cflags libavcodec libavformat libavutil libswscale)
+LIBS = $(FRAMEWORKS) $(FFMPEG_LIBS)
 
-all: $(TARGET)
+TARGET = artmaker
 
-$(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) $(OBJS) -o $(TARGET) $(FRAMEWORKS) $(LIBS)
-
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
-
-.PHONY: clean all
+$(TARGET): main.c
+	$(CC) $(CFLAGS) $(FFMPEG_CFLAGS) $< -o $@ $(LIBS)
 
 clean:
-	rm -f $(TARGET) $(OBJS) 
+	rm -f $(TARGET) 

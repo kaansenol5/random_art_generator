@@ -11,9 +11,25 @@ i have no idea how & why this works, i made this accidentally
  ~~~
 you need opengl and glut. 
 # Usage
-~~~
-./randomart width height pixelsize -p pattern
-~~~
+
+USAGE: ./artmaker <width> <height> <pixelsize> [options]
+
+Options:
+  -p, --pattern <type>   Set pattern type (original, polar, trig, fractal, wave, wave2, symmetry,
+                         vortex, kaleidoscope, cellular, psychedelic)
+  --fill-rects           Fill rectangles instead of outlines
+  -t, --threads <num>    Set number of threads (1-16, default: 4)
+  -out-mode <sec> <fps>  Generate video output instead of real-time display
+  -o, --output <file>    Specify output video filename (default: auto-generated)
+
+Controls (Real-time mode only):
+  ESC                    Exit program
+  Space                  Generate new random seed
+  0-9                    Change pattern type
+  C                      Cycle through color modes
+  R                      Cycle through randomness modes
+  +/-                    Increase/decrease number of threads
+
 
 pattern can be original, polar, fractal, trig, wave, symmetry and more. 
 press R to change some seeding logic, it gives a fuzzy look
@@ -27,5 +43,5 @@ press space to make it look good again
 
 # Issues
 1. I *still* do not know why this works
-2. It has a using 1.3GB's of ram problem
-3. It is kinda slow
+2. It has a ram problem
+3. It is kinda slow, but okay. 
